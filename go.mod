@@ -5,7 +5,7 @@ go 1.24.0
 toolchain go1.24.12
 
 require (
-	github.com/antithesishq/antithesis-sdk-go v0.5.0-default-no-op
+	github.com/antithesishq/antithesis-sdk-go v0.5.0
 	github.com/google/go-tpm v0.9.8
 	github.com/klauspost/compress v1.18.3
 	github.com/nats-io/jwt/v2 v2.8.0
