@@ -53,3 +53,9 @@ coverage.out
 
 # Cross compiled binaries
 pkg
+
+# AI assistant config
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+QWEN.md
