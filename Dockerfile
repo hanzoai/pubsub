@@ -1,4 +1,5 @@
-FROM --platform=$BUILDPLATFORM golang:alpine AS builder
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 ARG VERSION="dev"
 ARG GIT_COMMIT
@@ -14,9 +15,15 @@ ENV GOOS=$TARGETOS \
 RUN apk add --no-cache ca-certificates && update-ca-certificates
 
 WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
 COPY . /src
 
-RUN go build -trimpath \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath \
     -ldflags "-w -X server.serverVersion=${VERSION} -X server.gitCommit=${GIT_COMMIT}" \
     -o /out/pubsub .
 
