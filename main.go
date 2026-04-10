@@ -1,4 +1,4 @@
-// Copyright 2012-2025 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,8 +18,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 
+	"github.com/nats-io/nats-server/v2/internal/mgmt"
 	"github.com/nats-io/nats-server/v2/server"
 )
 
@@ -79,6 +81,10 @@ Cluster Options:
         --connect_retries <number>   For implicit routes, number of connect retries
         --cluster_listen <url>       Cluster url from which members can solicit routes
 
+Management Options:
+    PUBSUB_ZAP_PORT                  ZAP control plane port (default: 9222, env)
+    PUBSUB_HTTP_PORT                 HTTP management API port (default: 9280, env)
+
 Profiling Options:
         --profile <port>             Profiling HTTP port
 
@@ -125,6 +131,19 @@ func main() {
 	// Start things up. Block here until done.
 	if err := server.Run(s); err != nil {
 		server.PrintAndDie(err.Error())
+	}
+
+	// Start management server (ZAP transport + HTTP routes)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ms := mgmt.New(mgmt.Config{
+		NATSServer: s,
+		Logger:     logger,
+	})
+	if err := ms.Start(); err != nil {
+		// Log but don't die -- NATS core is already running
+		logger.Error("failed to start management server", "error", err)
+	} else {
+		defer ms.Stop()
 	}
 
 	s.WaitForShutdown()

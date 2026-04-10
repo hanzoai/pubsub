@@ -1,0 +1,500 @@
+// Copyright 2026 Hanzo AI Inc. All rights reserved.
+// Licensed under the Apache License, Version 2.0.
+
+// Package mgmt provides ZAP transport and HTTP management routes for pubsub.
+// ZAP is the control plane protocol; NATS stays for pub/sub messaging.
+package mgmt
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/luxfi/zap"
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+// ZAP opcodes for control plane operations.
+const (
+	OpCreateStream  uint16 = 0x01
+	OpDeleteStream  uint16 = 0x02
+	OpListStreams   uint16 = 0x03
+	OpPublish       uint16 = 0x04
+	OpGetStreamInfo uint16 = 0x05
+	OpHealthCheck   uint16 = 0x06
+)
+
+// ZAP object field offsets for requests.
+const (
+	// CreateStream / DeleteStream / GetStreamInfo: name at offset 0 (text = offset+len = 8 bytes)
+	FieldName = 0
+
+	// CreateStream: subjects at offset 8 (text, comma-separated)
+	FieldSubjects = 8
+
+	// Publish: subject at offset 0 (text), payload at offset 8 (bytes)
+	FieldSubject = 0
+	FieldPayload = 8
+
+	// Response: status at offset 0 (uint8, 0=ok, 1=error), message at offset 8 (text)
+	FieldStatus  = 0
+	FieldMessage = 8
+	FieldData    = 16
+
+	// Object sizes
+	RequestSize  = 24
+	ResponseSize = 64
+)
+
+// Config configures the management server.
+type Config struct {
+	NATSServer *server.Server
+	ZAPPort    int
+	HTTPPort   int
+	Logger     *slog.Logger
+}
+
+// Server is the management server providing ZAP transport and HTTP routes.
+type Server struct {
+	ns         *server.Server
+	nc         *nats.Conn
+	js         jetstream.JetStream
+	zapNode    *zap.Node
+	zapPort    int
+	httpPort   int
+	httpServer *http.Server
+	httpLn     net.Listener
+	logger     *slog.Logger
+}
+
+// New creates a new management server.
+func New(cfg Config) *Server {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.ZAPPort == 0 {
+		cfg.ZAPPort = envInt("PUBSUB_ZAP_PORT", 9222)
+	}
+	if cfg.HTTPPort == 0 {
+		cfg.HTTPPort = envInt("PUBSUB_HTTP_PORT", 9280)
+	}
+
+	return &Server{
+		ns:       cfg.NATSServer,
+		zapPort:  cfg.ZAPPort,
+		httpPort: cfg.HTTPPort,
+		logger:   cfg.Logger,
+	}
+}
+
+// Start starts the ZAP listener and HTTP management server.
+// Must be called after the NATS server is ready to accept connections.
+func (s *Server) Start() error {
+	// Connect to the NATS server as an internal client
+	nc, err := nats.Connect(s.ns.ClientURL(), nats.InProcessServer(s.ns))
+	if err != nil {
+		return fmt.Errorf("mgmt: nats connect: %w", err)
+	}
+	s.nc = nc
+
+	if s.ns.JetStreamEnabled() {
+		js, err := jetstream.New(nc)
+		if err != nil {
+			nc.Close()
+			return fmt.Errorf("mgmt: jetstream init: %w", err)
+		}
+		s.js = js
+	}
+
+	// Start ZAP node
+	s.zapNode = zap.NewNode(zap.NodeConfig{
+		NodeID:      "pubsub-mgmt",
+		ServiceType: "_pubsub._tcp",
+		Port:        s.zapPort,
+		Logger:      s.logger,
+		NoDiscovery: true,
+	})
+	s.registerZAPHandlers()
+
+	if err := s.zapNode.Start(); err != nil {
+		nc.Close()
+		return fmt.Errorf("mgmt: zap start: %w", err)
+	}
+	s.logger.Info("management ZAP listener started", "port", s.zapPort)
+
+	// Start HTTP
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pubsub/health", s.handleHealth)
+	mux.HandleFunc("/v1/pubsub/varz", s.handleVarz)
+	mux.HandleFunc("/v1/pubsub/connz", s.handleConnz)
+	mux.HandleFunc("/v1/pubsub/streams", s.handleStreams)
+
+	s.httpServer = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.httpPort))
+	if err != nil {
+		s.zapNode.Stop()
+		nc.Close()
+		return fmt.Errorf("mgmt: http listen: %w", err)
+	}
+	s.httpLn = ln
+	s.logger.Info("management HTTP server started", "addr", ln.Addr().String())
+
+	go func() {
+		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			s.logger.Error("management HTTP server error", "error", err)
+		}
+	}()
+
+	return nil
+}
+
+// Stop gracefully stops the management server.
+func (s *Server) Stop() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if s.httpServer != nil {
+		s.httpServer.Shutdown(ctx)
+	}
+	if s.zapNode != nil {
+		s.zapNode.Stop()
+	}
+	if s.nc != nil {
+		s.nc.Close()
+	}
+	s.logger.Info("management server stopped")
+}
+
+// registerZAPHandlers wires up opcode handlers on the ZAP node.
+func (s *Server) registerZAPHandlers() {
+	s.zapNode.Handle(OpCreateStream, s.zapCreateStream)
+	s.zapNode.Handle(OpDeleteStream, s.zapDeleteStream)
+	s.zapNode.Handle(OpListStreams, s.zapListStreams)
+	s.zapNode.Handle(OpPublish, s.zapPublish)
+	s.zapNode.Handle(OpGetStreamInfo, s.zapGetStreamInfo)
+	s.zapNode.Handle(OpHealthCheck, s.zapHealthCheck)
+}
+
+// --- ZAP Handlers ---
+
+func (s *Server) zapCreateStream(ctx context.Context, _ string, msg *zap.Message) (*zap.Message, error) {
+	root := msg.Root()
+	name := root.Text(FieldName)
+	subjectsRaw := root.Text(FieldSubjects)
+
+	if name == "" {
+		return zapError("stream name required")
+	}
+	if s.js == nil {
+		return zapError("jetstream not enabled")
+	}
+
+	subjects := splitSubjects(subjectsRaw)
+	if len(subjects) == 0 {
+		subjects = []string{name + ".>"}
+	}
+
+	_, err := s.js.CreateStream(ctx, jetstream.StreamConfig{
+		Name:     name,
+		Subjects: subjects,
+	})
+	if err != nil {
+		return zapError(err.Error())
+	}
+
+	return zapOK("stream created: " + name)
+}
+
+func (s *Server) zapDeleteStream(ctx context.Context, _ string, msg *zap.Message) (*zap.Message, error) {
+	root := msg.Root()
+	name := root.Text(FieldName)
+
+	if name == "" {
+		return zapError("stream name required")
+	}
+	if s.js == nil {
+		return zapError("jetstream not enabled")
+	}
+
+	if err := s.js.DeleteStream(ctx, name); err != nil {
+		return zapError(err.Error())
+	}
+
+	return zapOK("stream deleted: " + name)
+}
+
+func (s *Server) zapListStreams(_ context.Context, _ string, _ *zap.Message) (*zap.Message, error) {
+	info, err := s.listStreamsFromServer()
+	if err != nil {
+		return zapError(err.Error())
+	}
+
+	data, err := json.Marshal(info)
+	if err != nil {
+		return zapError(err.Error())
+	}
+
+	return zapOKWithData(data)
+}
+
+func (s *Server) zapPublish(_ context.Context, _ string, msg *zap.Message) (*zap.Message, error) {
+	root := msg.Root()
+	subject := root.Text(FieldSubject)
+	payload := root.Bytes(FieldPayload)
+
+	if subject == "" {
+		return zapError("subject required")
+	}
+
+	if err := s.nc.Publish(subject, payload); err != nil {
+		return zapError(err.Error())
+	}
+
+	return zapOK("published to " + subject)
+}
+
+func (s *Server) zapGetStreamInfo(ctx context.Context, _ string, msg *zap.Message) (*zap.Message, error) {
+	root := msg.Root()
+	name := root.Text(FieldName)
+
+	if name == "" {
+		return zapError("stream name required")
+	}
+	if s.js == nil {
+		return zapError("jetstream not enabled")
+	}
+
+	stream, err := s.js.Stream(ctx, name)
+	if err != nil {
+		return zapError(err.Error())
+	}
+
+	si, err := stream.Info(ctx)
+	if err != nil {
+		return zapError(err.Error())
+	}
+
+	info := streamInfoResponse{
+		Name:     si.Config.Name,
+		Subjects: si.Config.Subjects,
+		Messages: si.State.Msgs,
+		Bytes:    si.State.Bytes,
+		FirstSeq: si.State.FirstSeq,
+		LastSeq:  si.State.LastSeq,
+	}
+
+	data, err := json.Marshal(info)
+	if err != nil {
+		return zapError(err.Error())
+	}
+
+	return zapOKWithData(data)
+}
+
+func (s *Server) zapHealthCheck(_ context.Context, _ string, _ *zap.Message) (*zap.Message, error) {
+	status := s.ns.Healthz(&server.HealthzOptions{})
+	if status.Error != "" {
+		return zapError(status.Error)
+	}
+	return zapOK(status.Status)
+}
+
+// --- HTTP Handlers ---
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	hz := s.ns.Healthz(&server.HealthzOptions{})
+	resp := map[string]any{
+		"status":      hz.Status,
+		"jetstream":   s.ns.JetStreamEnabled(),
+		"server_id":   s.ns.ID(),
+		"server_name": s.ns.Name(),
+	}
+	if hz.Error != "" {
+		resp["error"] = hz.Error
+	}
+
+	writeJSON(w, resp)
+}
+
+func (s *Server) handleVarz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	varz, err := s.ns.Varz(&server.VarzOptions{})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, varz)
+}
+
+func (s *Server) handleConnz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	connz, err := s.ns.Connz(&server.ConnzOptions{})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, connz)
+}
+
+func (s *Server) handleStreams(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.ns.JetStreamEnabled() {
+		writeJSON(w, map[string]any{"streams": []any{}, "count": 0})
+		return
+	}
+
+	info, err := s.listStreamsFromServer()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, map[string]any{"streams": info, "count": len(info)})
+}
+
+// --- Helpers ---
+
+type streamInfoResponse struct {
+	Name     string   `json:"name"`
+	Subjects []string `json:"subjects"`
+	Messages uint64   `json:"messages"`
+	Bytes    uint64   `json:"bytes"`
+	FirstSeq uint64   `json:"first_seq"`
+	LastSeq  uint64   `json:"last_seq"`
+}
+
+func (s *Server) listStreamsFromServer() ([]streamInfoResponse, error) {
+	jsz, err := s.ns.Jsz(&server.JSzOptions{Accounts: true})
+	if err != nil {
+		return nil, err
+	}
+
+	var streams []streamInfoResponse
+	for _, ai := range jsz.AccountDetails {
+		for _, si := range ai.Streams {
+			streams = append(streams, streamInfoResponse{
+				Name:     si.Config.Name,
+				Subjects: si.Config.Subjects,
+				Messages: si.State.Msgs,
+				Bytes:    si.State.Bytes,
+				FirstSeq: si.State.FirstSeq,
+				LastSeq:  si.State.LastSeq,
+			})
+		}
+	}
+
+	if streams == nil {
+		streams = []streamInfoResponse{}
+	}
+	return streams, nil
+}
+
+func zapOK(message string) (*zap.Message, error) {
+	b := zap.NewBuilder(256)
+	obj := b.StartObject(ResponseSize)
+	obj.SetUint8(FieldStatus, 0)
+	obj.SetText(FieldMessage, message)
+	obj.FinishAsRoot()
+	return zap.Parse(b.Finish())
+}
+
+func zapOKWithData(data []byte) (*zap.Message, error) {
+	b := zap.NewBuilder(256 + len(data))
+	obj := b.StartObject(ResponseSize)
+	obj.SetUint8(FieldStatus, 0)
+	obj.SetBytes(FieldData, data)
+	obj.FinishAsRoot()
+	return zap.Parse(b.Finish())
+}
+
+func zapError(message string) (*zap.Message, error) {
+	b := zap.NewBuilder(256)
+	obj := b.StartObject(ResponseSize)
+	obj.SetUint8(FieldStatus, 1)
+	obj.SetText(FieldMessage, message)
+	obj.FinishAsRoot()
+	return zap.Parse(b.Finish())
+}
+
+func splitSubjects(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var subjects []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == ',' {
+			if t := trimSpace(s[start:i]); t != "" {
+				subjects = append(subjects, t)
+			}
+			start = i + 1
+		}
+	}
+	if t := trimSpace(s[start:]); t != "" {
+		subjects = append(subjects, t)
+	}
+	return subjects
+}
+
+func trimSpace(s string) string {
+	i, j := 0, len(s)
+	for i < j && s[i] == ' ' {
+		i++
+	}
+	for j > i && s[j-1] == ' ' {
+		j--
+	}
+	return s[i:j]
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
