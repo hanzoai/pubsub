@@ -22,11 +22,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server/ats"
-	"github.com/nats-io/nats-server/v2/server/avl"
-	"github.com/nats-io/nats-server/v2/server/gsl"
-	"github.com/nats-io/nats-server/v2/server/stree"
-	"github.com/nats-io/nats-server/v2/server/thw"
+	"github.com/hanzoai/pubsub/server/ats"
+	"github.com/hanzoai/pubsub/server/avl"
+	"github.com/hanzoai/pubsub/server/gsl"
+	"github.com/hanzoai/pubsub/server/stree"
+	"github.com/hanzoai/pubsub/server/thw"
 )
 
 // TODO(dlc) - This is a fairly simplistic approach but should do for now.

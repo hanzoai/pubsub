@@ -42,12 +42,12 @@ import (
 
 	"github.com/klauspost/compress/s2"
 	"github.com/minio/highwayhash"
-	"github.com/nats-io/nats-server/v2/server/ats"
-	"github.com/nats-io/nats-server/v2/server/avl"
-	"github.com/nats-io/nats-server/v2/server/elastic"
-	"github.com/nats-io/nats-server/v2/server/gsl"
-	"github.com/nats-io/nats-server/v2/server/stree"
-	"github.com/nats-io/nats-server/v2/server/thw"
+	"github.com/hanzoai/pubsub/server/ats"
+	"github.com/hanzoai/pubsub/server/avl"
+	"github.com/hanzoai/pubsub/server/elastic"
+	"github.com/hanzoai/pubsub/server/gsl"
+	"github.com/hanzoai/pubsub/server/stree"
+	"github.com/hanzoai/pubsub/server/thw"
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 )

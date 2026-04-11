@@ -29,7 +29,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/nats-io/nats-server/v2/server"
+	"github.com/hanzoai/pubsub/server"
 )
 
 var noOpErrHandler = func(_ *nats.Conn, _ *nats.Subscription, _ error) {}

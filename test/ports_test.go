@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server"
+	"github.com/hanzoai/pubsub/server"
 )
 
 // waits until a calculated list of listeners is resolved or a timeout
