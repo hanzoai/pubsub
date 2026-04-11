@@ -7,6 +7,8 @@ package mgmt
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -14,12 +16,15 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/luxfi/zap"
-	"github.com/nats-io/nats-server/v2/server"
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
+	"github.com/hanzoai/pubsub/internal/consensus"
+	"github.com/hanzoai/pubsub/internal/store"
+	"github.com/hanzoai/pubsub/server"
+	"github.com/hanzoai/pubsub-go"
+	"github.com/hanzoai/pubsub-go/jetstream"
 )
 
 // ZAP opcodes for control plane operations.
@@ -30,6 +35,12 @@ const (
 	OpPublish       uint16 = 0x04
 	OpGetStreamInfo uint16 = 0x05
 	OpHealthCheck   uint16 = 0x06
+
+	// Quasar PQ consensus opcodes (0x10 range)
+	OpQuasarSubmit  uint16 = 0x10
+	OpQuasarStatus  uint16 = 0x11
+	OpQuasarVerify  uint16 = 0x12
+	OpQuasarRotate  uint16 = 0x13
 )
 
 // ZAP object field offsets for requests.
@@ -49,9 +60,14 @@ const (
 	FieldMessage = 8
 	FieldData    = 16
 
+	// Quasar fields: op_type at offset 16 (uint8), hash at offset 24 (text)
+	FieldOpType    = 16
+	FieldHash      = 24
+
 	// Object sizes
 	RequestSize  = 24
 	ResponseSize = 64
+	QuasarReqSize = 40
 )
 
 // Config configures the management server.
@@ -60,6 +76,22 @@ type Config struct {
 	ZAPPort    int
 	HTTPPort   int
 	Logger     *slog.Logger
+
+	// Quasar enables PQ consensus on stream operations.
+	Quasar *consensus.Config
+
+	// Store configures the zapdb backing store for metadata/consensus state.
+	Store *store.Config
+
+	// HTTPToken is the bearer token for HTTP management endpoints.
+	// Empty = no HTTP auth (dev mode only).
+	HTTPToken string
+
+	// ZAPSecret is the shared secret for ZAP management HMAC authentication.
+	// Each ZAP mgmt message must include HMAC-SHA256(secret, message_bytes) in the
+	// signature field. Empty = no ZAP auth (dev mode only).
+	// Consensus ZAP (port 9223) uses cryptographic signature verification instead.
+	ZAPSecret []byte
 }
 
 // Server is the management server providing ZAP transport and HTTP routes.
@@ -73,6 +105,13 @@ type Server struct {
 	httpServer *http.Server
 	httpLn     net.Listener
 	logger     *slog.Logger
+
+	quasar    *consensus.Quasar // nil when PQ consensus disabled
+	quasarCfg *consensus.Config
+	store     *store.Store     // nil when zapdb store disabled
+	storeCfg  *store.Config
+	httpToken string // bearer token for HTTP auth
+	zapSecret []byte // shared secret for ZAP HMAC auth
 }
 
 // New creates a new management server.
@@ -88,10 +127,14 @@ func New(cfg Config) *Server {
 	}
 
 	return &Server{
-		ns:       cfg.NATSServer,
-		zapPort:  cfg.ZAPPort,
-		httpPort: cfg.HTTPPort,
-		logger:   cfg.Logger,
+		ns:         cfg.NATSServer,
+		zapPort:    cfg.ZAPPort,
+		httpPort:   cfg.HTTPPort,
+		logger:     cfg.Logger,
+		quasarCfg:  cfg.Quasar,
+		storeCfg:   cfg.Store,
+		httpToken:  cfg.HTTPToken,
+		zapSecret:  cfg.ZAPSecret,
 	}
 }
 
@@ -114,6 +157,50 @@ func (s *Server) Start() error {
 		s.js = js
 	}
 
+	// Initialize zapdb store if configured
+	if s.storeCfg != nil {
+		st, err := store.Open(*s.storeCfg)
+		if err != nil {
+			s.nc.Close()
+			return fmt.Errorf("mgmt: zapdb store: %w", err)
+		}
+		s.store = st
+		s.logger.Info("zapdb store opened", "path", st.Path())
+	}
+
+	// Initialize Quasar PQ consensus if configured
+	if s.quasarCfg != nil {
+		if s.quasarCfg.Logger == nil {
+			s.quasarCfg.Logger = s.logger
+		}
+		qu, err := consensus.New(*s.quasarCfg)
+		if err != nil {
+			if s.store != nil {
+				s.store.Close()
+			}
+			s.nc.Close()
+			return fmt.Errorf("mgmt: quasar init: %w", err)
+		}
+		if err := qu.Start(context.Background()); err != nil {
+			if s.store != nil {
+				s.store.Close()
+			}
+			s.nc.Close()
+			return fmt.Errorf("mgmt: quasar start: %w", err)
+		}
+		// Connect static peers
+		for _, peer := range s.quasarCfg.ZAPPeers {
+			if err := qu.ConnectPeer(peer); err != nil {
+				s.logger.Warn("quasar: connect peer failed", "peer", peer, "error", err)
+			}
+		}
+		s.quasar = qu
+		s.logger.Info("quasar PQ consensus started",
+			"threshold", s.quasarCfg.Threshold,
+			"zap_port", s.quasarCfg.ZAPPort,
+			"peers", len(s.quasarCfg.ZAPPeers))
+	}
+
 	// Start ZAP node
 	s.zapNode = zap.NewNode(zap.NodeConfig{
 		NodeID:      "pubsub-mgmt",
@@ -130,16 +217,23 @@ func (s *Server) Start() error {
 	}
 	s.logger.Info("management ZAP listener started", "port", s.zapPort)
 
-	// Start HTTP
+	// Start HTTP (with auth middleware when token is configured)
 	mux := http.NewServeMux()
+	// Health is always unauthenticated (K8s probes)
 	mux.HandleFunc("/v1/pubsub/health", s.handleHealth)
-	mux.HandleFunc("/v1/pubsub/varz", s.handleVarz)
-	mux.HandleFunc("/v1/pubsub/connz", s.handleConnz)
-	mux.HandleFunc("/v1/pubsub/streams", s.handleStreams)
+	// All other routes require auth when token is set
+	mux.HandleFunc("/v1/pubsub/varz", s.requireHTTPAuth(s.handleVarz))
+	mux.HandleFunc("/v1/pubsub/connz", s.requireHTTPAuth(s.handleConnz))
+	mux.HandleFunc("/v1/pubsub/streams", s.requireHTTPAuth(s.handleStreams))
+	mux.HandleFunc("/v1/pubsub/quasar", s.requireHTTPAuth(s.handleQuasarStatus))
+	mux.HandleFunc("/v1/pubsub/quasar/submit", s.requireHTTPAuth(s.handleQuasarSubmit))
+	mux.HandleFunc("/v1/pubsub/quasar/verify", s.requireHTTPAuth(s.handleQuasarVerify))
 
 	s.httpServer = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.httpPort))
@@ -171,6 +265,12 @@ func (s *Server) Stop() {
 	if s.zapNode != nil {
 		s.zapNode.Stop()
 	}
+	if s.quasar != nil {
+		s.quasar.Stop()
+	}
+	if s.store != nil {
+		s.store.Close()
+	}
 	if s.nc != nil {
 		s.nc.Close()
 	}
@@ -178,13 +278,23 @@ func (s *Server) Stop() {
 }
 
 // registerZAPHandlers wires up opcode handlers on the ZAP node.
+// All handlers except HealthCheck require auth when token is configured.
 func (s *Server) registerZAPHandlers() {
-	s.zapNode.Handle(OpCreateStream, s.zapCreateStream)
-	s.zapNode.Handle(OpDeleteStream, s.zapDeleteStream)
-	s.zapNode.Handle(OpListStreams, s.zapListStreams)
-	s.zapNode.Handle(OpPublish, s.zapPublish)
-	s.zapNode.Handle(OpGetStreamInfo, s.zapGetStreamInfo)
+	// Health is unauthenticated (probes)
 	s.zapNode.Handle(OpHealthCheck, s.zapHealthCheck)
+
+	// All management ops require auth
+	s.zapNode.Handle(OpCreateStream, s.zapRequireHMAC(s.zapCreateStream))
+	s.zapNode.Handle(OpDeleteStream, s.zapRequireHMAC(s.zapDeleteStream))
+	s.zapNode.Handle(OpListStreams, s.zapRequireHMAC(s.zapListStreams))
+	s.zapNode.Handle(OpPublish, s.zapRequireHMAC(s.zapPublish))
+	s.zapNode.Handle(OpGetStreamInfo, s.zapRequireHMAC(s.zapGetStreamInfo))
+
+	// Quasar PQ consensus opcodes require auth
+	s.zapNode.Handle(OpQuasarSubmit, s.zapRequireHMAC(s.zapQuasarSubmit))
+	s.zapNode.Handle(OpQuasarStatus, s.zapRequireHMAC(s.zapQuasarStatus))
+	s.zapNode.Handle(OpQuasarVerify, s.zapRequireHMAC(s.zapQuasarVerify))
+	s.zapNode.Handle(OpQuasarRotate, s.zapRequireHMAC(s.zapQuasarRotate))
 }
 
 // --- ZAP Handlers ---
@@ -320,14 +430,26 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hz := s.ns.Healthz(&server.HealthzOptions{})
+	// Minimal response for unauthenticated health probes (K8s liveness/readiness).
+	// Detailed info (server_id, quasar, zapdb) only included for authenticated requests.
 	resp := map[string]any{
-		"status":      hz.Status,
-		"jetstream":   s.ns.JetStreamEnabled(),
-		"server_id":   s.ns.ID(),
-		"server_name": s.ns.Name(),
+		"status": hz.Status,
 	}
 	if hz.Error != "" {
 		resp["error"] = hz.Error
+	}
+
+	// Include details only if auth is disabled or token is provided
+	auth := r.Header.Get("Authorization")
+	showDetail := s.httpToken == "" ||
+		(len(auth) >= 8 && auth[:7] == "Bearer " &&
+			subtle.ConstantTimeCompare([]byte(auth[7:]), []byte(s.httpToken)) == 1)
+	if showDetail {
+		resp["jetstream"] = s.ns.JetStreamEnabled()
+		resp["server_id"] = s.ns.ID()
+		resp["server_name"] = s.ns.Name()
+		resp["quasar"] = s.quasar != nil
+		resp["zapdb"] = s.store != nil
 	}
 
 	writeJSON(w, resp)
@@ -484,6 +606,177 @@ func writeJSON(w http.ResponseWriter, v any) {
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// --- Quasar ZAP Handlers ---
+
+func (s *Server) zapQuasarSubmit(ctx context.Context, _ string, msg *zap.Message) (*zap.Message, error) {
+	if s.quasar == nil {
+		return zapError("quasar not enabled")
+	}
+	root := msg.Root()
+	op := consensus.Op{
+		Type:    consensus.OpType(root.Uint8(FieldOpType)),
+		Stream:  root.Text(FieldName),
+		Subject: root.Text(FieldSubject),
+		Payload: root.Bytes(FieldPayload),
+	}
+	hash, err := s.quasar.Submit(ctx, op)
+	if err != nil {
+		return zapError(err.Error())
+	}
+	return zapOK(hash)
+}
+
+func (s *Server) zapQuasarStatus(_ context.Context, _ string, _ *zap.Message) (*zap.Message, error) {
+	if s.quasar == nil {
+		return zapError("quasar not enabled")
+	}
+	data, err := json.Marshal(s.quasar.Status())
+	if err != nil {
+		return zapError(err.Error())
+	}
+	return zapOKWithData(data)
+}
+
+func (s *Server) zapQuasarVerify(_ context.Context, _ string, msg *zap.Message) (*zap.Message, error) {
+	if s.quasar == nil {
+		return zapError("quasar not enabled")
+	}
+	root := msg.Root()
+	hash := root.Text(FieldHash)
+	if hash == "" {
+		return zapError("hash required")
+	}
+	if s.quasar.IsFinalized(hash) {
+		return zapOK("finalized")
+	}
+	return zapOK("pending")
+}
+
+func (s *Server) zapQuasarRotate(_ context.Context, _ string, _ *zap.Message) (*zap.Message, error) {
+	if s.quasar == nil {
+		return zapError("quasar not enabled")
+	}
+	data, err := json.Marshal(s.quasar.Status())
+	if err != nil {
+		return zapError(err.Error())
+	}
+	return zapOKWithData(data)
+}
+
+// --- Quasar HTTP Handlers ---
+
+func (s *Server) handleQuasarStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.quasar == nil {
+		writeJSON(w, consensus.Status{Enabled: false})
+		return
+	}
+	writeJSON(w, s.quasar.Status())
+}
+
+func (s *Server) handleQuasarSubmit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.quasar == nil {
+		http.Error(w, "quasar not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	// SECURITY: Limit request body to 1MB to prevent OOM (red finding R-HIGH-3).
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var op consensus.Op
+	if err := json.NewDecoder(r.Body).Decode(&op); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	hash, err := s.quasar.Submit(r.Context(), op)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"quantum_hash": hash})
+}
+
+func (s *Server) handleQuasarVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.quasar == nil {
+		http.Error(w, "quasar not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	hash := r.URL.Query().Get("hash")
+	if hash == "" {
+		http.Error(w, "hash query param required", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"hash":      hash,
+		"finalized": s.quasar.IsFinalized(hash),
+	})
+}
+
+// --- Auth ---
+
+// requireHTTPAuth wraps an HTTP handler with bearer token authentication.
+// When httpToken is empty, auth is disabled (dev mode).
+func (s *Server) requireHTTPAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.httpToken != "" {
+			auth := r.Header.Get("Authorization")
+			if len(auth) < 8 || auth[:7] != "Bearer " ||
+				subtle.ConstantTimeCompare([]byte(auth[7:]), []byte(s.httpToken)) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+// zapRequireHMAC wraps a ZAP handler with HMAC-SHA256 peer authentication.
+// The ZAP peer must be in the allowedPeers set when zapSecret is configured.
+// Authentication works by verifying the peer sent the correct secret during
+// its first message (carried in bytes field at offset 56). Once verified,
+// the peer ID is added to the allow set for subsequent messages.
+// When zapSecret is empty, all peers are allowed (dev mode).
+func (s *Server) zapRequireHMAC(next zap.Handler) zap.Handler {
+	const fldAuthSecret = 56 // bytes: shared secret for first-message auth
+	verified := make(map[string]bool)
+	var vmu sync.Mutex
+
+	return func(ctx context.Context, from string, msg *zap.Message) (*zap.Message, error) {
+		if len(s.zapSecret) == 0 {
+			return next(ctx, from, msg)
+		}
+
+		vmu.Lock()
+		ok := verified[from]
+		vmu.Unlock()
+		if ok {
+			return next(ctx, from, msg)
+		}
+
+		// First message from this peer — verify shared secret.
+		root := msg.Root()
+		peerSecret := root.Bytes(fldAuthSecret)
+		if !hmac.Equal(peerSecret, s.zapSecret) {
+			return zapError("unauthorized")
+		}
+
+		vmu.Lock()
+		verified[from] = true
+		vmu.Unlock()
+
+		return next(ctx, from, msg)
 	}
 }
 

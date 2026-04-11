@@ -35,9 +35,9 @@ import (
 	"time"
 
 	"github.com/nats-io/jwt/v2"
-	"github.com/nats-io/nats-server/v2/conf"
-	"github.com/nats-io/nats-server/v2/server/certidp"
-	"github.com/nats-io/nats-server/v2/server/certstore"
+	"github.com/hanzoai/pubsub/conf"
+	"github.com/hanzoai/pubsub/server/certidp"
+	"github.com/hanzoai/pubsub/server/certstore"
 	"github.com/nats-io/nkeys"
 )
 
