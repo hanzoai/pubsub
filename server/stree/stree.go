@@ -18,7 +18,7 @@ import (
 	"slices"
 	"unsafe"
 
-	"github.com/nats-io/nats-server/v2/server/gsl"
+	"github.com/hanzoai/pubsub/server/gsl"
 )
 
 // SubjectTree is an adaptive radix trie (ART) for storing subject information on literal subjects.
