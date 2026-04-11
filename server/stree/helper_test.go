@@ -16,7 +16,7 @@ package stree
 import (
 	"testing"
 
-	"github.com/nats-io/nats-server/v2/internal/antithesis"
+	"github.com/hanzoai/pubsub/internal/antithesis"
 )
 
 func require_True(t testing.TB, b bool) {

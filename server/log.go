@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	srvlog "github.com/nats-io/nats-server/v2/logger"
+	srvlog "github.com/hanzoai/pubsub/logger"
 )
 
 // Logger interface of the NATS Server
