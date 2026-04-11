@@ -37,7 +37,7 @@ import (
 
 	crand "crypto/rand"
 
-	"github.com/nats-io/nats-server/v2/server/gsl"
+	"github.com/hanzoai/pubsub/server/gsl"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
 )

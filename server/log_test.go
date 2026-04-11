@@ -22,8 +22,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/internal/testhelper"
-	"github.com/nats-io/nats-server/v2/logger"
+	"github.com/hanzoai/pubsub/internal/testhelper"
+	"github.com/hanzoai/pubsub/logger"
 )
 
 func TestSetLogger(t *testing.T) {

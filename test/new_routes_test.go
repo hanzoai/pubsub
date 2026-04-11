@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/logger"
-	"github.com/nats-io/nats-server/v2/server"
+	"github.com/hanzoai/pubsub/logger"
+	"github.com/hanzoai/pubsub/server"
 	"github.com/nats-io/nats.go"
 )
 
