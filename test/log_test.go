@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server"
+	"github.com/hanzoai/pubsub/server"
 )
 
 func RunServerWithLogging(opts *server.Options) *server.Server {

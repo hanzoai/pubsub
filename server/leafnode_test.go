@@ -38,8 +38,8 @@ import (
 	jwt "github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 
-	"github.com/nats-io/nats-server/v2/internal/fastrand"
-	"github.com/nats-io/nats-server/v2/internal/testhelper"
+	"github.com/hanzoai/pubsub/internal/fastrand"
+	"github.com/hanzoai/pubsub/internal/testhelper"
 )
 
 type captureLeafNodeRandomIPLogger struct {

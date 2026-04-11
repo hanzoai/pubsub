@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server/thw"
+	"github.com/hanzoai/pubsub/server/thw"
 )
 
 // Error for when we try to decode a binary-encoded message schedule with an unknown version number.
