@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server"
+	"github.com/hanzoai/pubsub/server"
 )
 
 func startTestServer(t *testing.T) (*server.Server, *Server) {
@@ -225,6 +225,51 @@ func TestSplitSubjects(t *testing.T) {
 				t.Errorf("splitSubjects(%q)[%d] = %q, want %q", tt.input, i, got[i], tt.want[i])
 			}
 		}
+	}
+}
+
+func TestQuasarStatusDisabled(t *testing.T) {
+	_, mgmt := startTestServer(t)
+
+	resp, err := http.Get(mgmtURL(mgmt, "/v1/pubsub/quasar"))
+	if err != nil {
+		t.Fatalf("GET /v1/pubsub/quasar: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if body["enabled"] != false {
+		t.Errorf("expected quasar disabled, got %v", body["enabled"])
+	}
+}
+
+func TestHealthIncludesQuasarField(t *testing.T) {
+	_, mgmt := startTestServer(t)
+
+	resp, err := http.Get(mgmtURL(mgmt, "/v1/pubsub/health"))
+	if err != nil {
+		t.Fatalf("GET /v1/pubsub/health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if _, ok := body["quasar"]; !ok {
+		t.Error("expected quasar field in health response")
+	}
+	if _, ok := body["zapdb"]; !ok {
+		t.Error("expected zapdb field in health response")
 	}
 }
 

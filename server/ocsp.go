@@ -33,8 +33,8 @@ import (
 
 	"golang.org/x/crypto/ocsp"
 
-	"github.com/nats-io/nats-server/v2/server/certidp"
-	"github.com/nats-io/nats-server/v2/server/certstore"
+	"github.com/hanzoai/pubsub/server/certidp"
+	"github.com/hanzoai/pubsub/server/certstore"
 )
 
 const (

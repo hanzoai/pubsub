@@ -17,13 +17,13 @@ RUN update-ca-certificates
 WORKDIR /src
 RUN mkdir -p /src/out/$GOOS/$GOARCH
 
-COPY ./nats-server/ /src/nats-server/
+COPY ./pubsub/ /src/pubsub/
 COPY ./nsc/         /src/nsc/
 COPY ./natscli/     /src/natscli/
 
-RUN cd /src/nats-server && go build -trimpath \
+RUN cd /src/pubsub && go build -trimpath \
        -ldflags "-w -X server.serverVersion=${VERSION},server.gitCommit=${GIT_COMMIT}" \
-       -o /src/out/$TARGETOS/$TARGETARCH/nats-server .
+       -o /src/out/$TARGETOS/$TARGETARCH/pubsub .
 
 RUN cd /src/natscli && go build -trimpath \
        -ldflags "-w -X main.version=${VERSION}" \
@@ -37,13 +37,13 @@ FROM --platform=$TARGETPLATFORM alpine:latest
 ARG TARGETOS
 ARG TARGETARCH
 
-COPY ./nats-server/docker/nats-server.conf                     /nats/conf/nats-server.conf
+COPY ./pubsub/docker/pubsub.conf                     /nats/conf/pubsub.conf
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt         /etc/ssl/certs/
-COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nats-server /bin/nats-server
+COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/pubsub /bin/pubsub
 COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nats        /bin/nats
 COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nsc         /bin/nsc
 
 EXPOSE 4222 8222 6222 5222
 
-ENTRYPOINT ["/bin/nats-server"]
-CMD ["-c", "/nats/conf/nats-server.conf"]
+ENTRYPOINT ["/bin/pubsub"]
+CMD ["-c", "/nats/conf/pubsub.conf"]

@@ -31,8 +31,8 @@ import (
 	"time"
 
 	"github.com/minio/highwayhash"
-	"github.com/nats-io/nats-server/v2/server/sysmem"
-	"github.com/nats-io/nats-server/v2/server/tpm"
+	"github.com/hanzoai/pubsub/server/sysmem"
+	"github.com/hanzoai/pubsub/server/tpm"
 	"github.com/nats-io/nkeys"
 	"github.com/nats-io/nuid"
 )
