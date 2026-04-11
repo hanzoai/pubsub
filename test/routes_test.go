@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/internal/testhelper"
-	"github.com/nats-io/nats-server/v2/server"
+	"github.com/hanzoai/pubsub/internal/testhelper"
+	"github.com/hanzoai/pubsub/server"
 	"github.com/nats-io/nats.go"
 )
 

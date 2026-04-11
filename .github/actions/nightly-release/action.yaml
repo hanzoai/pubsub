@@ -29,19 +29,19 @@ runs:
       shell: sh
       run: |
         echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
-        echo "GIT_COMMIT=$(cd ${{ inputs.workdir }}/nats-server && git rev-parse --short HEAD)" >> $GITHUB_ENV
+        echo "GIT_COMMIT=$(cd ${{ inputs.workdir }}/pubsub && git rev-parse --short HEAD)" >> $GITHUB_ENV
         echo "BUILD_NAME=$(echo ${{ inputs.name }} | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.-]/-/g')" >> $GITHUB_ENV
 
     - name: Build and push Docker images
       uses: docker/build-push-action@v6
       with:
         context: "${{ github.workspace }}/src/github.com/nats-io"
-        file: "${{ github.workspace }}/src/github.com/nats-io/nats-server/docker/Dockerfile.nightly"
+        file: "${{ github.workspace }}/src/github.com/hanzoai/pubsub/docker/Dockerfile.nightly"
         build-args: |
           VERSION=nightly-${{ env.BUILD_DATE }}
           GIT_COMMIT=${{ env.GIT_COMMIT }}
         platforms: linux/amd64,linux/arm64
         push: true
         tags: |
-          synadia/nats-server:${{ env.BUILD_NAME }}
-          synadia/nats-server:${{ env.BUILD_NAME }}-${{ env.BUILD_DATE }}
+          synadia/pubsub:${{ env.BUILD_NAME }}
+          synadia/pubsub:${{ env.BUILD_NAME }}-${{ env.BUILD_DATE }}
