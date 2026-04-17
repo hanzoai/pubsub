@@ -26,9 +26,12 @@ PubSub streams → zapdb (AES-256 at rest) → age (ML-KEM-768+X25519) → S3/di
 - Restore: PQ-decrypted with luxfi/age HybridIdentity
 
 ## Quasar Consensus
-Dual consensus with two independent hardness assumptions:
+Upstream `luxfi/consensus` HEAD implements triple consensus (BLS + Corona + ML-DSA).
+PubSub pins `luxfi/consensus` v1.22.0 which has dual consensus (BLS + ML-DSA/Corona):
 1. **BLS12-381** — classical fast-path, 48-byte aggregate proof
 2. **PQ proof** (ML-DSA-65 or Corona Ring-LWE) — post-quantum, variable size
+
+Triple mode (`TripleSignRound1`, all 3 in parallel) available when pubsub upgrades to v1.23+.
 
 Types: `QuasarConsensus`, `QuasarSignature` (aliases for upstream v1.22.0 legacy names).
 
