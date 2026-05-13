@@ -1,6 +1,6 @@
 module github.com/hanzoai/pubsub
 
-go 1.26.1
+go 1.26.3
 
 require (
 	github.com/antithesishq/antithesis-sdk-go v0.7.0
@@ -9,7 +9,7 @@ require (
 	github.com/klauspost/compress v1.18.5
 	github.com/luxfi/age v1.4.0
 	github.com/luxfi/consensus v1.22.0
-	github.com/luxfi/zap v0.2.0
+	github.com/zap-proto/go v0.2.0
 	github.com/luxfi/zapdb v1.0.0
 	github.com/nats-io/jwt/v2 v2.8.1
 	github.com/nats-io/nats.go v1.48.0
