@@ -4,6 +4,8 @@
 NATS server fork with Quasar PQ consensus, ZAP control plane, zapdb persistence,
 and PQ-safe encrypted replication via luxfi/age (ML-KEM-768 + X25519).
 
+**Upstream**: [NATS Server](https://github.com/nats-io/nats-server) (Apache-2.0). `server/` imports `nats-io/*` directly; the rest is Hanzo-built.
+
 Go module: `github.com/hanzoai/pubsub`
 Binary: `pubsub`
 JetStream (persistent streams/consumers/KV) enabled by default.
