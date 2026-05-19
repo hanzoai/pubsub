@@ -5,7 +5,7 @@ go 1.26.3
 require (
 	github.com/antithesishq/antithesis-sdk-go v0.7.0
 	github.com/google/go-tpm v0.9.8
-	github.com/hanzoai/pubsub-go v1.48.0
+	github.com/hanzoai/pubsub-go v1.0.1-0.20260513042624-1b25bdfe16a6
 	github.com/klauspost/compress v1.18.5
 	github.com/luxfi/age v1.4.0
 	github.com/luxfi/consensus v1.22.0
@@ -60,7 +60,3 @@ require (
 // been made that includes https://github.com/minio/highwayhash/pull/29.
 // This will be updated if a new tag covers this in the future.
 require github.com/minio/highwayhash v1.0.4
-
-// Use local fork of the Go client (hanzoai/pubsub-go).
-// server/ still imports nats-io/nats.go (upstream fork code — left as-is).
-replace github.com/hanzoai/pubsub-go => ../pubsub-go
