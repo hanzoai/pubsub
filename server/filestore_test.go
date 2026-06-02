@@ -43,6 +43,7 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/hanzoai/pubsub/server/ats"
@@ -819,6 +820,76 @@ func TestFileStorePurge(t *testing.T) {
 	})
 }
 
+func TestFileStoreEncryptedPurgeRecoveryAfterKeyRename(t *testing.T) {
+	fcfg := FileStoreConfig{
+		StoreDir:    t.TempDir(),
+		Cipher:      AES,
+		Compression: NoCompression,
+		BlockSize:   64 * 1024,
+	}
+	created := time.Now()
+	cfg := StreamConfig{Name: "zzz", Storage: FileStorage}
+
+	fs, err := newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+	require_NoError(t, err)
+
+	subj, msg := "foo", make([]byte, 8*1024)
+	toStore := uint64(1024)
+	for i := uint64(0); i < toStore; i++ {
+		_, _, err = fs.StoreMsg(subj, nil, msg, 0)
+		require_NoError(t, err)
+	}
+	baseline := fs.State()
+
+	storeDir := fcfg.StoreDir
+	mdir := filepath.Join(storeDir, msgDir)
+	preMsgs := filepath.Join(storeDir, "msgs.pre")
+	// Snapshot the pre-purge msg directory so we can recreate the crash window.
+	require_NoError(t, copyDir(t, preMsgs, mdir))
+
+	// Run a real purge once to create a valid encrypted tombstone block + key.
+	_, err = fs.Purge()
+	require_NoError(t, err)
+
+	fs.mu.RLock()
+	tombIdx := fs.lmb.index
+	fs.mu.RUnlock()
+
+	require_NoError(t, fs.stop(false, false))
+
+	postMsgs := filepath.Join(storeDir, "msgs.post")
+	require_NoError(t, os.Rename(mdir, postMsgs))
+	require_NoError(t, copyDir(t, mdir, preMsgs))
+	// Force recovery from the block files instead of a fresh full-state snapshot.
+	require_NoError(t, os.RemoveAll(filepath.Join(mdir, streamStreamStateFile)))
+
+	tombBlk := fmt.Sprintf(blkScan, tombIdx)
+	tombKey := fmt.Sprintf(keyScan, tombIdx)
+	require_NoError(t, os.Rename(filepath.Join(postMsgs, tombBlk), filepath.Join(mdir, tombBlk)))
+
+	ndir := filepath.Join(storeDir, newMsgDir)
+	require_NoError(t, os.MkdirAll(ndir, defaultDirPerms))
+	// Simulate a crash after moving N.key into __new_msgs__ but before moving N.blk.
+	require_NoError(t, os.Rename(filepath.Join(postMsgs, tombKey), filepath.Join(ndir, tombKey)))
+
+	fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	state := fs.State()
+	require_Equal(t, state.Msgs, baseline.Msgs)
+	require_Equal(t, state.Bytes, baseline.Bytes)
+	require_Equal(t, state.FirstSeq, baseline.FirstSeq)
+	require_Equal(t, state.LastSeq, baseline.LastSeq)
+
+	if _, err := os.Stat(filepath.Join(mdir, tombBlk)); !os.IsNotExist(err) {
+		t.Fatalf("Expected rollback to remove %q, got err=%v", tombBlk, err)
+	}
+	if _, err := os.Stat(ndir); !os.IsNotExist(err) {
+		t.Fatalf("Expected rollback to remove %q, got err=%v", ndir, err)
+	}
+}
+
 func TestFileStoreCompact(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		fcfg.BlockSize = 350
@@ -1244,7 +1315,9 @@ func TestFileStoreBitRot(t *testing.T) {
 			t.Fatalf("Expected %d msgs, got %d", toStore, state.Msgs)
 		}
 
-		if ld := fs.checkMsgs(); ld != nil && len(ld.Msgs) > 0 {
+		if ld, err := fs.checkMsgs(); err != nil {
+			t.Fatalf("Unexpected error from checkMsgs: %v", err)
+		} else if ld != nil && len(ld.Msgs) > 0 {
 			t.Fatalf("Expected to have no corrupt msgs, got %d", len(ld.Msgs))
 		}
 
@@ -1269,7 +1342,8 @@ func TestFileStoreBitRot(t *testing.T) {
 			os.WriteFile(lmb.mfn, contents, 0644)
 			fs.mu.Unlock()
 
-			ld := fs.checkMsgs()
+			ld, err := fs.checkMsgs()
+			require_NoError(t, err)
 			if len(ld.Msgs) > 0 {
 				break
 			}
@@ -1292,7 +1366,9 @@ func TestFileStoreBitRot(t *testing.T) {
 		defer fs.Stop()
 
 		// checkMsgs will repair the underlying store, so checkMsgs should be clean now.
-		if ld := fs.checkMsgs(); ld != nil {
+		if ld, err := fs.checkMsgs(); err != nil {
+			t.Fatalf("Unexpected error from checkMsgs: %v", err)
+		} else if ld != nil {
 			// If we have no msgs left this will report the head msgs as lost again.
 			if state := fs.State(); state.Msgs > 0 {
 				t.Fatalf("Expected no errors restoring checked and fixed filestore, got %+v", ld)
@@ -1629,7 +1705,7 @@ func TestFileStoreCollapseDmap(t *testing.T) {
 
 func TestFileStoreReadCache(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
-		fcfg.CacheExpire = 100 * time.Millisecond
+		fcfg.CacheExpire = ats.TickInterval
 
 		subj, msg := "foo.bar", make([]byte, 1024)
 		storedMsgSize := fileStoreMsgSize(subj, nil, msg)
@@ -1760,9 +1836,10 @@ func TestFileStoreInvalidIndexesRebuilt(t *testing.T) {
 
 		toSend := 5
 		for i := 0; i < toSend; i++ {
-			fs.StoreMsg("foo", nil, []byte("ok-1"), 0)
+			_, _, err = fs.StoreMsg("foo", nil, []byte("ok-1"), 0)
+			require_NoError(t, err)
 		}
-		fs.FlushAllPending()
+		require_NoError(t, fs.FlushAllPending())
 
 		// Now we're going to mangle the in-memory cache by changing
 		// the sequence number of the first message. We also need to
@@ -1926,8 +2003,9 @@ func TestFileStoreSnapshot(t *testing.T) {
 			// Should not call compact on last msg block.
 			if mb != fs.lmb {
 				mb.mu.Lock()
-				mb.compact()
+				err = mb.compact()
 				mb.mu.Unlock()
+				require_NoError(t, err)
 			}
 		}
 		fs.mu.RUnlock()
@@ -2593,6 +2671,52 @@ func TestFileStoreConsumerRedeliveredLost(t *testing.T) {
 	})
 }
 
+func TestFileStoreConsumerUpdateAcksFlushesRedelivered(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// MaxDeliver: 1 means that on the second delivery the message is dropped from
+		// pending while still being tracked in Redelivered.
+		cfg := &ConsumerConfig{AckPolicy: AckExplicit, MaxDeliver: 1}
+		o, err := fs.ConsumerStore("o22", time.Time{}, cfg)
+		require_NoError(t, err)
+
+		restartConsumer := func() {
+			t.Helper()
+			require_NoError(t, o.Stop())
+			time.Sleep(200 * time.Millisecond) // Wait for all things to settle.
+			o, err = fs.ConsumerStore("o22", time.Time{}, cfg)
+			require_NoError(t, err)
+		}
+
+		ts := time.Now().UnixNano()
+		require_NoError(t, o.UpdateDelivered(1, 1, 1, ts))
+		// Redelivery exceeds MaxDeliver, so sseq 1 is removed from pending but kept
+		// in Redelivered.
+		require_NoError(t, o.UpdateDelivered(2, 1, 2, ts))
+
+		// Persist and recover so we know the Redelivered entry is on disk.
+		restartConsumer()
+		state, err := o.State()
+		require_NoError(t, err)
+		require_Equal(t, len(state.Pending), 0)
+		require_Equal(t, len(state.Redelivered), 1)
+
+		// Acking sseq 1 deletes it from Redelivered, but UpdateAcks bails out with
+		// ErrStoreMsgNotFound since it is no longer pending. The deletion must still
+		// be flushed.
+		require_Error(t, o.UpdateAcks(2, 1), ErrStoreMsgNotFound)
+
+		restartConsumer()
+		defer o.Stop()
+		state, err = o.State()
+		require_NoError(t, err)
+		require_Equal(t, len(state.Redelivered), 0)
+	})
+}
+
 func TestFileStoreConsumerFlusher(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
@@ -3099,7 +3223,8 @@ func TestFileStoreExpireMsgsOnStart(t *testing.T) {
 		// Check the filtered subject state and make sure that is tracked properly.
 		checkFiltered := func(subject string, ss SimpleState) {
 			t.Helper()
-			fss := fs.FilteredState(1, subject)
+			fss, err := fs.FilteredState(1, subject)
+			require_NoError(t, err)
 			if fss != ss {
 				t.Fatalf("Expected FilteredState of %+v, got %+v", ss, fss)
 			}
@@ -3293,8 +3418,9 @@ func TestFileStoreSparseCompaction(t *testing.T) {
 			fs.mu.RUnlock()
 
 			mb.mu.Lock()
-			mb.compact()
+			err = mb.compact()
 			mb.mu.Unlock()
+			require_NoError(t, err)
 
 			fs.FastState(&ssa)
 			if !reflect.DeepEqual(ssb, ssa) {
@@ -3366,8 +3492,14 @@ func TestFileStoreSparseCompactionWithInteriorDeletes(t *testing.T) {
 		// Do compact by hand, make sure we can still access msgs past the interior deletes.
 		fs.mu.RLock()
 		lmb := fs.lmb
-		lmb.dirtyCloseWithRemove(false)
-		lmb.compact()
+		if err = lmb.dirtyCloseWithRemove(false); err != nil {
+			fs.mu.RUnlock()
+			require_NoError(t, err)
+		}
+		if err = lmb.compact(); err != nil {
+			fs.mu.RUnlock()
+			require_NoError(t, err)
+		}
 		fs.mu.RUnlock()
 
 		if _, err = fs.LoadMsg(900, nil); err != nil {
@@ -3394,7 +3526,9 @@ func TestFileStorePurgeExKeepOneBug(t *testing.T) {
 		fs.StoreMsg("A", nil, []byte("META"), 0)
 		fs.StoreMsg("B", nil, fill, 0)
 
-		if fss := fs.FilteredState(1, "A"); fss.Msgs != 2 {
+		fss, err := fs.FilteredState(1, "A")
+		require_NoError(t, err)
+		if fss.Msgs != 2 {
 			t.Fatalf("Expected to find 2 `A` msgs, got %d", fss.Msgs)
 		}
 
@@ -3405,7 +3539,9 @@ func TestFileStorePurgeExKeepOneBug(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("Expected PurgeEx to remove 1 `A` msgs, got %d", n)
 		}
-		if fss := fs.FilteredState(1, "A"); fss.Msgs != 1 {
+		fss, err = fs.FilteredState(1, "A")
+		require_NoError(t, err)
+		if fss.Msgs != 1 {
 			t.Fatalf("Expected to find 1 `A` msgs, got %d", fss.Msgs)
 		}
 	})
@@ -3418,15 +3554,19 @@ func TestFileStoreFilteredPendingBug(t *testing.T) {
 		require_NoError(t, err)
 		defer fs.Stop()
 
-		fs.StoreMsg("foo", nil, []byte("msg"), 0)
-		fs.StoreMsg("bar", nil, []byte("msg"), 0)
-		fs.StoreMsg("baz", nil, []byte("msg"), 0)
+		_, _, err = fs.StoreMsg("foo", nil, []byte("msg"), 0)
+		require_NoError(t, err)
+		_, _, err = fs.StoreMsg("bar", nil, []byte("msg"), 0)
+		require_NoError(t, err)
+		_, _, err = fs.StoreMsg("baz", nil, []byte("msg"), 0)
+		require_NoError(t, err)
 
 		fs.mu.Lock()
 		mb := fs.lmb
 		fs.mu.Unlock()
 
-		total, f, l := mb.filteredPending("foo", false, 3)
+		total, f, l, err := mb.filteredPending("foo", false, 3)
+		require_NoError(t, err)
 		if total != 0 {
 			t.Fatalf("Expected total of 0 but got %d", total)
 		}
@@ -3724,8 +3864,9 @@ func TestFileStoreRebuildStateDmapAccountingBug(t *testing.T) {
 		check()
 
 		mb.mu.Lock()
-		mb.compact()
+		err = mb.compact()
 		mb.mu.Unlock()
+		require_NoError(t, err)
 
 		// Now delete first.
 		_, err = fs.RemoveMsg(1)
@@ -3772,7 +3913,7 @@ func TestFileStorePurgeExWithSubject(t *testing.T) {
 		require_True(t, len(buf) > 0)
 
 		// This should purge all "foo.1"
-		p, err := fs.PurgeEx("foo.1", 1, 0)
+		p, err := fs.PurgeEx("foo.1", 0, 0)
 		require_NoError(t, err)
 		require_Equal(t, p, uint64(total))
 
@@ -3852,7 +3993,7 @@ func TestFileStorePurgeExNoTombsOnBlockRemoval(t *testing.T) {
 
 		// This should purge all "foo.1". This will remove the blocks so we want to make sure
 		// we do not write excessive tombstones here.
-		p, err := fs.PurgeEx("foo.1", 1, 0)
+		p, err := fs.PurgeEx("foo.1", 0, 0)
 		require_NoError(t, err)
 		require_Equal(t, p, uint64(total))
 
@@ -4438,7 +4579,9 @@ func TestFileStoreFSSExpireNumPendingBug(t *testing.T) {
 		_, _, err = fs.StoreMsg("KV.X", nil, []byte("Y"), 0)
 		require_NoError(t, err)
 
-		if fss := fs.FilteredState(1, "KV.X"); fss.Msgs != 1 {
+		fss, err := fs.FilteredState(1, "KV.X")
+		require_NoError(t, err)
+		if fss.Msgs != 1 {
 			t.Fatalf("Expected only 1 msg, got %d", fss.Msgs)
 		}
 	})
@@ -4813,7 +4956,9 @@ func TestFileStoreMsgBlkFailOnKernelFaultLostDataReporting(t *testing.T) {
 		defer fs.Stop()
 
 		// Need checkMsgs to catch interior one.
-		require_True(t, fs.checkMsgs() != nil)
+		ld, err := fs.checkMsgs()
+		require_NoError(t, err)
+		require_True(t, ld != nil)
 
 		state = fs.State()
 		require_Equal(t, state.FirstSeq, 94)
@@ -4847,7 +4992,8 @@ func TestFileStoreAllFilteredStateWithDeleted(t *testing.T) {
 		}
 
 		checkFilteredState := func(start, msgs, first, last int) {
-			fss := fs.FilteredState(uint64(start), _EMPTY_)
+			fss, err := fs.FilteredState(uint64(start), _EMPTY_)
+			require_NoError(t, err)
 			if fss.Msgs != uint64(msgs) {
 				t.Fatalf("Expected %d msgs, got %d", msgs, fss.Msgs)
 			}
@@ -5354,7 +5500,7 @@ func TestFileStoreErrPartialLoadOnSyncClose(t *testing.T) {
 	require_True(t, lmb != nil)
 
 	lmb.mu.Lock()
-	lmb.expireCacheLocked()
+	lmb.tryExpireCacheLocked()
 	lmb.dirtyCloseWithRemove(false)
 	lmb.mu.Unlock()
 
@@ -6048,8 +6194,9 @@ func TestFileStoreMsgBlockCompactionAndHoles(t *testing.T) {
 
 	// Do compaction, should remove all excess now.
 	mb.mu.Lock()
-	mb.compact()
+	err = mb.compact()
 	mb.mu.Unlock()
+	require_NoError(t, err)
 
 	ta, ua, _ := fs.Utilization()
 	require_Equal(t, ub, ua)
@@ -6282,8 +6429,11 @@ func TestFileStoreCompactAndPSIMWhenDeletingBlocks(t *testing.T) {
 	psi := *info
 	fs.mu.RUnlock()
 
+	// PSIM remains the same, since we'll not always know
+	// that the head was removed, instead of the tail.
 	require_Equal(t, psi.total, 1)
-	require_Equal(t, psi.fblk, psi.lblk)
+	require_Equal(t, psi.fblk, 1)
+	require_Equal(t, psi.lblk, 4)
 }
 
 func TestFileStoreTrackSubjLenForPSIM(t *testing.T) {
@@ -6609,7 +6759,7 @@ func TestFileStorePurgeExBufPool(t *testing.T) {
 		fs.StoreMsg("foo.bar", nil, msg, 0)
 	}
 
-	p, err := fs.PurgeEx("foo.bar", 1, 0)
+	p, err := fs.PurgeEx("foo.bar", 0, 0)
 	require_NoError(t, err)
 	require_Equal(t, p, 1000)
 
@@ -6648,7 +6798,7 @@ func TestFileStoreFSSMeta(t *testing.T) {
 	// Let cache's expire before PurgeEx which will load them back in.
 	time.Sleep(500 * time.Millisecond)
 
-	p, err := fs.PurgeEx("A", 1, 0)
+	p, err := fs.PurgeEx("A", 0, 0)
 	require_NoError(t, err)
 	require_Equal(t, p, 2)
 
@@ -6697,7 +6847,7 @@ func TestFileStoreExpireCacheOnLinearWalk(t *testing.T) {
 	}
 	// Let them all expire. This way we load as we walk and can test that we expire all blocks without
 	// needing to worry about last write times blocking forced expiration.
-	time.Sleep(expire + ats.TickInterval)
+	time.Sleep(expire + ats.TickInterval*2)
 
 	checkNoCache := func() {
 		t.Helper()
@@ -6881,8 +7031,9 @@ func TestFileStoreEraseMsgWithDbitSlots(t *testing.T) {
 	fs.mu.RUnlock()
 	// Compact.
 	mb.mu.Lock()
-	mb.compact()
+	err = mb.compact()
 	mb.mu.Unlock()
+	require_NoError(t, err)
 
 	removed, err := fs.EraseMsg(1)
 	require_NoError(t, err)
@@ -6909,8 +7060,9 @@ func TestFileStoreEraseMsgWithAllTrailingDbitSlots(t *testing.T) {
 	fs.mu.RUnlock()
 	// Compact.
 	mb.mu.Lock()
-	mb.compact()
+	err = mb.compact()
 	mb.mu.Unlock()
+	require_NoError(t, err)
 
 	removed, err := fs.EraseMsg(2)
 	require_NoError(t, err)
@@ -7220,8 +7372,9 @@ func TestFileStoreRecoverWithRemovesAndNoIndexDB(t *testing.T) {
 	lmb := fs.lmb
 	fs.mu.RUnlock()
 	lmb.mu.Lock()
-	lmb.compact()
+	err = lmb.compact()
 	lmb.mu.Unlock()
+	require_NoError(t, err)
 	// Stop but remove index.db
 	sfile := filepath.Join(sd, msgDir, streamStreamStateFile)
 	fs.Stop()
@@ -7389,8 +7542,9 @@ func TestFileStoreFilteredPendingPSIMFirstBlockUpdate(t *testing.T) {
 	// No make sure that a call to numFilterPending which will initially walk all blocks if starting from seq 1 updates psi.
 	var ss SimpleState
 	fs.mu.RLock()
-	fs.numFilteredPending("foo.baz", &ss)
+	err = fs.numFilteredPending("foo.baz", &ss)
 	fs.mu.RUnlock()
+	require_NoError(t, err)
 	require_Equal(t, ss.Msgs, 2)
 	require_Equal(t, ss.First, 1002)
 	require_Equal(t, ss.Last, 1003)
@@ -7465,8 +7619,9 @@ func TestFileStoreWildcardFilteredPendingPSIMFirstBlockUpdate(t *testing.T) {
 	// No make sure that a call to numFilterPending which will initially walk all blocks if starting from seq 1 updates psi.
 	var ss SimpleState
 	fs.mu.RLock()
-	fs.numFilteredPending("foo.22.*", &ss)
+	err = fs.numFilteredPending("foo.22.*", &ss)
 	fs.mu.RUnlock()
+	require_NoError(t, err)
 	require_Equal(t, ss.Msgs, 4)
 	require_Equal(t, ss.First, 1003)
 	require_Equal(t, ss.Last, 1006)
@@ -7544,8 +7699,9 @@ func TestFileStoreFilteredPendingPSIMFirstBlockUpdateNextBlock(t *testing.T) {
 	// Call into numFilterePending(), we want to make sure it updates fblk.
 	var ss SimpleState
 	fs.mu.Lock()
-	fs.numFilteredPending("foo.22.bar", &ss)
+	err = fs.numFilteredPending("foo.22.bar", &ss)
 	fs.mu.Unlock()
+	require_NoError(t, err)
 	require_Equal(t, ss.Msgs, 3)
 	require_Equal(t, ss.First, 3)
 	require_Equal(t, ss.Last, 7)
@@ -7576,8 +7732,9 @@ func TestFileStoreFilteredPendingPSIMFirstBlockUpdateNextBlock(t *testing.T) {
 
 	// Now call wildcard version of numFilteredPending to make sure it clears.
 	fs.mu.Lock()
-	fs.numFilteredPending("foo.*.baz", &ss)
+	err = fs.numFilteredPending("foo.*.baz", &ss)
 	fs.mu.Unlock()
+	require_NoError(t, err)
 	require_Equal(t, ss.Msgs, 3)
 	require_Equal(t, ss.First, 4)
 	require_Equal(t, ss.Last, 8)
@@ -7915,7 +8072,10 @@ func TestFileStoreDmapBlockRecoverAfterCompact(t *testing.T) {
 	// Compact and rebuild the first blk. Do not have it call indexCacheBuf which will fix it up.
 	mb := fs.getFirstBlock()
 	mb.mu.Lock()
-	mb.compact()
+	if err = mb.compact(); err != nil {
+		mb.mu.Unlock()
+		require_NoError(t, err)
+	}
 	// Empty out dmap state.
 	mb.dmap.Empty()
 	ld, tombs, err := mb.rebuildStateLocked()
@@ -8047,9 +8207,10 @@ func TestFileStoreRestoreDeleteTombstonesExceedingMaxBlkSize(t *testing.T) {
 			mb.ensureRawBytesLoaded()
 			bytes, rbytes, shouldCompact := mb.bytes, mb.rbytes, mb.shouldCompactSync()
 			// Do the compact and make sure nothing changed.
-			mb.compact()
+			err = mb.compact()
 			nbytes, nrbytes := mb.bytes, mb.rbytes
 			mb.mu.Unlock()
+			require_NoError(t, err)
 			require_True(t, shouldCompact)
 			require_Equal(t, bytes, nbytes)
 			require_Equal(t, rbytes, nrbytes)
@@ -8422,6 +8583,65 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 	}
 }
 
+func TestFileStoreMaxMsgsPerSubjectOneStaleFblkAfterRestart(t *testing.T) {
+	sd := t.TempDir()
+	fcfg := FileStoreConfig{StoreDir: sd, BlockSize: 256}
+	scfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}, Storage: FileStorage, MaxMsgsPer: 1}
+
+	fs, err := newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	msg := []byte("hello")
+
+	// Store "foo.0" into the first block.
+	_, _, err = fs.StoreMsg("foo.0", nil, msg, 0)
+	require_NoError(t, err)
+
+	// Fill the first block with other subjects until a second block is created.
+	for i := 1; fs.numMsgBlocks() < 2; i++ {
+		_, _, err = fs.StoreMsg(fmt.Sprintf("foo.%d", i), nil, msg, 0)
+		require_NoError(t, err)
+	}
+
+	// Store "foo.0" again. The message lands in the second block, and MaxMsgsPer=1 removes
+	// the copy in the first block. lblk should now point to the last block.
+	seq, _, err := fs.StoreMsg("foo.0", nil, msg, 0)
+	require_NoError(t, err)
+
+	// Sanity check, while the in-memory lblk is correct, the last message is found.
+	var smv StoreMsg
+	sm, err := fs.LoadLastMsg("foo.0", &smv)
+	require_NoError(t, err)
+	require_Equal(t, sm.seq, seq)
+
+	// Stop writes the stream state file.
+	require_NoError(t, fs.Stop())
+	_, err = os.Stat(filepath.Join(sd, msgDir, streamStreamStateFile))
+	require_NoError(t, err)
+
+	// Restart, and recover from the stream state file. On 2.12.x recovery would set lblk to the
+	// stale fblk, both pointing at the first block.
+	fs, err = newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// The last message for "foo.0" must still be found after a restart.
+	sm, err = fs.LoadLastMsg("foo.0", &smv)
+	require_NoError(t, err)
+	require_Equal(t, sm.subj, "foo.0")
+	require_Equal(t, sm.seq, seq)
+
+	// Validate internal subject state.
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	info, ok := fs.psim.Find(stringToBytes("foo.0"))
+	require_True(t, ok)
+	require_Equal(t, info.total, 1)
+	require_Equal(t, info.lblk, 2)
+	require_Equal(t, info.fblk, 2) // Since it's MaxMsgsPer:1, this should be optimized to last block.
+}
+
 func Benchmark_FileStoreSubjectStateConsistencyOptimizationPerf(b *testing.B) {
 	fs, err := newFileStore(
 		FileStoreConfig{StoreDir: b.TempDir()},
@@ -8604,6 +8824,78 @@ func TestFileStoreRecoverFullStateDetectCorruptState(t *testing.T) {
 
 	err = fs.recoverFullState()
 	require_Error(t, err, errCorruptState)
+}
+
+func TestFileStoreResetConsumerToStreamState(t *testing.T) {
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir()},
+		StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}, Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	msg := []byte("abc")
+	for i := 1; i <= 30; i++ {
+		_, _, err = fs.StoreMsg(fmt.Sprintf("foo.%d", i), nil, msg, 0)
+		require_NoError(t, err)
+	}
+
+	err = fs.writeFullState()
+	require_NoError(t, err)
+
+	obs, err := fs.ConsumerStore("c1", time.Now(), &ConsumerConfig{
+		Durable:       "c1",
+		FilterSubject: "foo.*",
+		AckPolicy:     AckNone,
+		DeliverPolicy: DeliverAll,
+	})
+
+	require_NoError(t, err)
+	defer obs.Stop()
+
+	state := &ConsumerState{}
+	state.Delivered = SequencePair{Consumer: 5, Stream: 5}
+	state.AckFloor = SequencePair{Consumer: 5, Stream: 5}
+
+	// set to 5
+	err = obs.Update(state)
+	require_NoError(t, err)
+
+	currState, err := obs.State()
+	require_NoError(t, err)
+
+	fsState := fs.State()
+	require_Equal(t, fsState.LastSeq, uint64(30))
+	require_Equal(t, fsState.FirstSeq, uint64(1))
+	require_Equal(t, currState.AckFloor, state.AckFloor)
+	require_Equal(t, currState.Delivered, state.Delivered)
+	require_Equal(t, len(currState.Redelivered), len(state.Redelivered))
+	require_Equal(t, len(currState.Pending), len(state.Pending))
+
+	fs.mu.Lock()
+	fs.state.FirstSeq = 0
+	fs.state.LastSeq = 0
+	fs.mu.Unlock()
+
+	// set back to lower values
+	newState := &ConsumerState{
+		Delivered: SequencePair{Consumer: 1, Stream: 4},
+		AckFloor:  SequencePair{Consumer: 1, Stream: 3},
+	}
+
+	// update should fail but force update should pass
+	err = obs.Update(newState)
+	require_Error(t, err, ErrStoreOldUpdate)
+
+	err = obs.ForceUpdate(newState)
+	require_NoError(t, err)
+
+	currState, err = obs.State()
+	require_NoError(t, err)
+
+	require_Equal(t, currState.AckFloor, newState.AckFloor)
+	require_Equal(t, currState.Delivered, newState.Delivered)
+	require_Equal(t, len(currState.Redelivered), len(newState.Redelivered))
+	require_Equal(t, len(currState.Pending), len(newState.Pending))
 }
 
 func TestFileStoreNumPendingMulti(t *testing.T) {
@@ -9038,7 +9330,7 @@ func TestFileStoreDontSpamCompactWhenMostlyTombstones(t *testing.T) {
 	require_True(t, fmb.shouldCompactInline())
 
 	// Compact will be successful, but since it doesn't clean up tombstones it will be ineffective.
-	fmb.compact()
+	require_NoError(t, fmb.compact())
 
 	// We should not allow compacting again as we're not removing tombstones inline.
 	// Otherwise, we would spam compaction.
@@ -9927,7 +10219,7 @@ func TestFileStoreFirstMatchingMultiExpiry(t *testing.T) {
 
 		fs.mu.RLock()
 		mb := fs.lmb
-		mb.expireCacheLocked()
+		mb.tryExpireCacheLocked()
 		fs.mu.RUnlock()
 
 		sl := gsl.NewSublist[struct{}]()
@@ -11411,7 +11703,7 @@ func TestFileStoreMissingDeletesAfterCompact(t *testing.T) {
 		require_True(t, fmb.dmap.Exists(6))
 
 		// Now compact and reload and the block should still have the correct deletes.
-		fmb.compact()
+		require_NoError(t, fmb.compact())
 		fmb.clearCache()
 		fmb.dmap.Empty()
 		require_NoError(t, fmb.loadMsgsWithLock())
@@ -11434,7 +11726,7 @@ func TestFileStoreMissingDeletesAfterCompact(t *testing.T) {
 		_, err = fs.RemoveMsg(5)
 		fmb.mu.Lock()
 		require_NoError(t, err)
-		fmb.compact()
+		require_NoError(t, fmb.compact())
 		fmb.clearCache()
 		fmb.dmap.Empty()
 		require_NoError(t, fmb.loadMsgsWithLock())

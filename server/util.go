@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"net"
 	"net/url"
 	"reflect"
@@ -121,6 +122,26 @@ func parseInt64(d []byte) (n int64) {
 		n = n*10 + (int64(dec) - asciiZero)
 	}
 	return n
+}
+
+// parseUint64 expects decimal positive numbers. Returns the value and true on success,
+// or 0 and false on invalid input or overflow.
+func parseUint64(d []byte) (uint64, bool) {
+	if len(d) == 0 {
+		return 0, false
+	}
+	var n uint64
+	for _, dec := range d {
+		if dec < asciiZero || dec > asciiNine {
+			return 0, false
+		}
+		digit := uint64(dec) - asciiZero
+		if n > math.MaxUint64/10 || (n == math.MaxUint64/10 && digit > math.MaxUint64%10) {
+			return 0, false
+		}
+		n = n*10 + digit
+	}
+	return n, true
 }
 
 // Helper to move from float seconds to time.Duration
@@ -362,4 +383,24 @@ func parallelTaskQueue(mp int) chan<- func() {
 		}()
 	}
 	return tq
+}
+
+// addSaturate returns a + b, saturating at math.MaxInt64.
+// Both a and b must be non-negative.
+func addSaturate(a, b int64) int64 {
+	sum, carry := bits.Add64(uint64(a), uint64(b), 0)
+	if carry != 0 || sum > uint64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(sum)
+}
+
+// mulSaturate returns a * b, saturating at math.MaxInt64.
+// Both a and b must be non-negative.
+func mulSaturate(a, b int64) int64 {
+	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	if hi != 0 || lo > uint64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(lo)
 }
