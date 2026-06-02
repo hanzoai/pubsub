@@ -1,4 +1,4 @@
-// Copyright 2013-2025 The NATS Authors
+// Copyright 2013-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,8 +13,10 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,6 +58,7 @@ func DefaultMonitorOptions() *Options {
 		NoSigs:       true,
 		Tags:         []string{"tag"},
 		Metadata:     map[string]string{"key1": "value1", "key2": "value2"},
+		FeatureFlags: map[string]bool{"feature": false, "fix": true, "revert_fix": true},
 	}
 }
 
@@ -304,14 +307,26 @@ func TestMonitorHandleVarz(t *testing.T) {
 		if v.InMsgs != 1 {
 			t.Fatalf("Expected InMsgs of 1, got %v\n", v.InMsgs)
 		}
-		if v.OutMsgs != 1 {
-			t.Fatalf("Expected OutMsgs of 1, got %v\n", v.OutMsgs)
-		}
 		if v.InBytes != 5 {
 			t.Fatalf("Expected InBytes of 5, got %v\n", v.InBytes)
 		}
+		if v.OutMsgs != 1 {
+			t.Fatalf("Expected OutMsgs of 1, got %v\n", v.OutMsgs)
+		}
 		if v.OutBytes != 5 {
 			t.Fatalf("Expected OutBytes of 5, got %v\n", v.OutBytes)
+		}
+		if v.InClientMsgs != 1 {
+			t.Fatalf("Expected InClientMsgs of 1, got %v\n", v.InClientMsgs)
+		}
+		if v.InClientBytes != 5 {
+			t.Fatalf("Expected InClientBytes of 5, got %v\n", v.InClientBytes)
+		}
+		if v.OutClientMsgs != 1 {
+			t.Fatalf("Expected OutClientMsgs of 1, got %v\n", v.OutClientMsgs)
+		}
+		if v.OutClientBytes != 5 {
+			t.Fatalf("Expected OutClientBytes of 5, got %v\n", v.OutClientBytes)
 		}
 		if v.Subscriptions <= 10 {
 			t.Fatalf("Expected Subscriptions of at least 10, got %v\n", v.Subscriptions)
@@ -4105,6 +4120,9 @@ func TestMonitorLeafz(t *testing.T) {
 	natsSub(t, nc2B, "foo", func(_ *nats.Msg) {})
 	natsFlush(t, nc2B)
 
+	checkSubInterest(t, sa, acc1.GetName(), "foo", time.Second)
+	checkSubInterest(t, sa, acc2.GetName(), "bar", time.Second)
+
 	nc1A := natsConnect(t, fmt.Sprintf("nats://user1:pwd@127.0.0.1:%d", oa.Port))
 	defer nc1A.Close()
 	natsPub(t, nc1A, "foo", []byte("hello"))
@@ -4351,6 +4369,84 @@ func TestMonitorAccountStatz(t *testing.T) {
 			}
 		}
 	}
+}
+
+// https://github.com/nats-io/nats-server/issues/8251
+func TestMonitorAccountStatzLeafNodes(t *testing.T) {
+	hubConf := createConfFile(t, []byte(`
+		server_name: "hub"
+		listen: "127.0.0.1:-1"
+		http: "127.0.0.1:-1"
+		accounts {
+			LEAF_ACC { users [{user: leaf, password: pwd}] }
+			CLIENT_ACC { users [{user: client, password: pwd}] }
+		}
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+	`))
+	hub, hubOpts := RunServerWithConfig(hubConf)
+	defer hub.Shutdown()
+
+	leafConf := createConfFile(t, []byte(fmt.Sprintf(`
+		server_name: "leaf"
+		listen: "127.0.0.1:-1"
+		leafnodes {
+			remotes = [
+				{url: "nats-leaf://leaf:pwd@127.0.0.1:%d"}
+			]
+		}
+	`, hubOpts.LeafNode.Port)))
+	leaf, _ := RunServerWithConfig(leafConf)
+	defer leaf.Shutdown()
+
+	checkLeafNodeConnected(t, hub)
+
+	// Connect a client to CLIENT_ACC, it will show up in the reporting.
+	nc := natsConnect(t, hub.ClientURL(), nats.UserInfo("client", "pwd"))
+	defer nc.Close()
+
+	checkAccounts := func(t *testing.T, stz *AccountStatz) {
+		t.Helper()
+		accounts := make(map[string]*AccountStat, len(stz.Accounts))
+		for _, acc := range stz.Accounts {
+			accounts[acc.Account] = acc
+		}
+
+		// The account with only a leaf node connection should be reported.
+		leafAcc, ok := accounts["LEAF_ACC"]
+		if !ok {
+			t.Fatalf("Expected account LEAF_ACC to be present, got %+v", stz.Accounts)
+		}
+		require_Equal(t, leafAcc.Conns, 0)
+		require_Equal(t, leafAcc.LeafNodes, 1)
+		require_Equal(t, leafAcc.TotalConns, 1)
+
+		// The account with a client connection should be reported.
+		clientAcc, ok := accounts["CLIENT_ACC"]
+		if !ok {
+			t.Fatalf("Expected account CLIENT_ACC to be present, got %+v", stz.Accounts)
+		}
+		require_Equal(t, clientAcc.Conns, 1)
+		require_Equal(t, clientAcc.LeafNodes, 0)
+		require_Equal(t, clientAcc.TotalConns, 1)
+
+		// Unused accounts should still be excluded.
+		if _, ok := accounts[DEFAULT_GLOBAL_ACCOUNT]; ok {
+			t.Fatalf("Did not expect unused account %q to be present, got %+v", DEFAULT_GLOBAL_ACCOUNT, stz.Accounts)
+		}
+	}
+
+	// Check without unused=true and without account filtering.
+	for pollMode := 0; pollMode < 2; pollMode++ {
+		stz := pollAccountStatz(t, hub, pollMode, fmt.Sprintf("http://127.0.0.1:%d%s", hub.MonitorAddr().Port, AccountStatzPath), &AccountStatzOptions{})
+		checkAccounts(t, stz)
+	}
+
+	// Check with explicit account filtering. Only available through AccountStatz() directly.
+	stz, err := hub.AccountStatz(&AccountStatzOptions{Accounts: []string{"LEAF_ACC", "CLIENT_ACC", DEFAULT_GLOBAL_ACCOUNT}})
+	require_NoError(t, err)
+	checkAccounts(t, stz)
 }
 
 func runMonitorServerWithOperator(t *testing.T, sysName, accName string) ([]*Server, nkeys.KeyPair, nkeys.KeyPair) {
@@ -4930,6 +5026,105 @@ func TestMonitorAuthorizedUsers(t *testing.T) {
 	defer c.Close()
 	// we should get the user's pubkey
 	checkAuthUser(upub)
+}
+
+func testMonitorConnzJWTVisibility(t *testing.T, bearer bool) {
+	t.Helper()
+
+	opts := DefaultMonitorOptions()
+	kp, _ := nkeys.FromSeed(oSeed)
+	pub, _ := kp.PublicKey()
+	opts.TrustedKeys = []string{pub}
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	nac := jwt.NewAccountClaims(apub)
+	ajwt, err := nac.Encode(oKp)
+	require_NoError(t, err)
+
+	nkp, _ := nkeys.CreateUser()
+	upub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(upub)
+	nuc.BearerToken = bearer
+	userJWT, err := nuc.Encode(akp)
+	require_NoError(t, err)
+
+	buildMemAccResolver(s)
+	addAccountToMemResolver(s, apub, ajwt)
+
+	conn, err := net.Dial("tcp", s.Addr().String())
+	require_NoError(t, err)
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+	require_NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	cr := bufio.NewReaderSize(conn, maxBufSize)
+	info, err := cr.ReadString('\n')
+	require_NoError(t, err)
+
+	var sigField string
+	if !bearer {
+		var ni nonceInfo
+		require_NoError(t, json.Unmarshal([]byte(info[5:]), &ni))
+		sigraw, err := nkp.Sign([]byte(ni.Nonce))
+		require_NoError(t, err)
+		sig := base64.RawURLEncoding.EncodeToString(sigraw)
+		sigField = fmt.Sprintf(",\"sig\":\"%s\"", sig)
+	}
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"verbose\":true,\"pedantic\":true%s}\r\n", userJWT, sigField)
+	_, err = conn.Write([]byte(cs))
+	require_NoError(t, err)
+	l, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected +OK, got %q", l)
+	}
+
+	expectedJWT := userJWT
+	if bearer {
+		expectedJWT = _EMPTY_
+	}
+
+	checkConnzJWT := func(url, expectedJWT string) {
+		t.Helper()
+		var connz *Connz
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			connz = pollConnz(t, s, 0, url, nil)
+			if len(connz.Conns) != 1 {
+				return fmt.Errorf("expected 1 connection, got %d", len(connz.Conns))
+			}
+			return nil
+		})
+		ci := connz.Conns[0]
+		require_Equal(t, ci.JWT, expectedJWT)
+	}
+
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d/connz", s.MonitorAddr().Port)
+	checkConnzJWT(baseURL+"?auth=1", expectedJWT)
+
+	require_NoError(t, conn.Close())
+	conn = nil
+
+	checkConnzJWT(baseURL+"?state=closed", expectedJWT)
+	checkConnzJWT(baseURL+"?auth=1&state=closed", expectedJWT)
+}
+
+func TestMonitorConnzJWTVisibility(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		bearer bool
+	}{
+		{name: "bearer", bearer: true},
+		{name: "non-bearer", bearer: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testMonitorConnzJWTVisibility(t, test.bearer)
+		})
+	}
 }
 
 // Helper function to check that a JS cluster is formed
@@ -5615,7 +5810,7 @@ func TestMonitorWebsocket(t *testing.T) {
 		TLSMap:           true,
 		TLSPinnedCerts:   pinnedCerts,
 		SameOrigin:       true,
-		AllowedOrigins:   []string{"origin1", "origin2"},
+		AllowedOrigins:   []string{"https://origin1", "https://origin2"},
 		Compression:      true,
 		HandshakeTimeout: 4 * time.Second,
 	}
@@ -5633,7 +5828,7 @@ func TestMonitorWebsocket(t *testing.T) {
 		TLSMap:           true,
 		TLSPinnedCerts:   []string{"7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"},
 		SameOrigin:       true,
-		AllowedOrigins:   []string{"origin1", "origin2"},
+		AllowedOrigins:   []string{"https://origin1", "https://origin2"},
 		Compression:      true,
 		HandshakeTimeout: 4 * time.Second,
 	}
@@ -6559,6 +6754,27 @@ func TestMonitorVarzMetadata(t *testing.T) {
 	}
 }
 
+func TestMonitorVarzFeatureFlags(t *testing.T) {
+	featureFlags["fix"] = false
+	t.Cleanup(func() { delete(featureFlags, "fix") })
+
+	expected := make(map[string]bool)
+	for k, v := range featureFlags {
+		expected[k] = v
+	}
+	expected["fix"] = true
+
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	v, err := s.Varz(nil)
+	require_NoError(t, err)
+
+	if !reflect.DeepEqual(expected, v.FeatureFlags) {
+		t.Fatalf("expected: %v, got: %v", expected, v.FeatureFlags)
+	}
+}
+
 func TestMonitorVarzTLSCertEndDate(t *testing.T) {
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
@@ -6600,4 +6816,68 @@ func TestMonitorVarzTLSCertEndDate(t *testing.T) {
 	check(t, v.LeafNode.TLSCertNotAfter)
 	check(t, v.MQTT.TLSCertNotAfter)
 	check(t, v.Websocket.TLSCertNotAfter)
+}
+
+func TestMetaClusterInfoSnapshotStats(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	// Create a stream to generate some meta activity.
+	s := c.randomNonLeader()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	leader := c.leader()
+	require_True(t, leader != nil)
+
+	// Check Jsz() includes Snapshot.
+	checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+		jsi, err := leader.Jsz(nil)
+		if err != nil {
+			return err
+		}
+		if jsi.Meta == nil {
+			return errors.New("expected meta cluster info from Jsz")
+		}
+		if jsi.Meta.Snapshot == nil {
+			return errors.New("expected snapshot stats in Jsz meta cluster info")
+		}
+		return nil
+	})
+
+	// Check Varz() includes Snapshot.
+	checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+		v, err := leader.Varz(nil)
+		if err != nil {
+			return err
+		}
+		if v.JetStream.Meta == nil {
+			return errors.New("expected meta cluster info from Varz")
+		}
+		if v.JetStream.Meta.Snapshot == nil {
+			return errors.New("expected snapshot stats in Varz meta cluster info")
+		}
+		return nil
+	})
+
+	// Check STATSZ event includes Snapshot.
+	snc, _ := jsClientConnect(t, c.randomServer(), nats.UserInfo("admin", "s3cr3t!"))
+	defer snc.Close()
+
+	ch := make(chan *nats.Msg, 1)
+	_, err = snc.ChanSubscribe(fmt.Sprintf(serverStatsSubj, leader.ID()), ch)
+	require_NoError(t, err)
+
+	msg := require_ChanRead(t, ch, 5*time.Second)
+	var m ServerStatsMsg
+	require_NoError(t, json.Unmarshal(msg.Data, &m))
+	require_True(t, m.Stats.JetStream != nil)
+	require_True(t, m.Stats.JetStream.Meta != nil)
+	require_True(t, m.Stats.JetStream.Meta.Snapshot != nil)
 }

@@ -82,6 +82,11 @@ func setStaticStreamMetadata(cfg *StreamConfig) {
 		requires(2)
 	}
 
+	// Fast batch publishing was added in v2.14 and requires API level 4.
+	if cfg.AllowBatchPublish {
+		requires(4)
+	}
+
 	cfg.Metadata[JSRequiredLevelMetadataKey] = strconv.Itoa(requiredApiLevel)
 }
 
@@ -156,6 +161,11 @@ func setStaticConsumerMetadata(cfg *ConsumerConfig) {
 
 	if cfg.PriorityPolicy != PriorityNone || cfg.PinnedTTL != 0 || len(cfg.PriorityGroups) > 0 {
 		requires(1)
+	}
+
+	// Added in 2.14
+	if cfg.AckPolicy == AckFlowControl {
+		requires(4)
 	}
 
 	cfg.Metadata[JSRequiredLevelMetadataKey] = strconv.Itoa(requiredApiLevel)
