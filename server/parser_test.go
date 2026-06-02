@@ -15,15 +15,19 @@ package server
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
+	"time"
 )
 
 func dummyClient() *client {
-	return &client{srv: New(&defaultServerOptions), msubs: -1, mpay: -1, mcl: MAX_CONTROL_LINE_SIZE}
+	opts := defaultServerOptions
+	return &client{srv: New(&opts), msubs: -1, mpay: -1, mcl: MAX_CONTROL_LINE_SIZE}
 }
 
 func dummyRouteClient() *client {
-	return &client{srv: New(&defaultServerOptions), kind: ROUTER}
+	opts := defaultServerOptions
+	return &client{srv: New(&opts), kind: ROUTER, mcl: MAX_CONTROL_LINE_SIZE}
 }
 
 func TestParsePing(t *testing.T) {
@@ -305,6 +309,22 @@ func TestParsePubBadSize(t *testing.T) {
 	if err := c.processPub([]byte("foo 2222222222222222")); err == nil {
 		t.Fatalf("Expected parse error for size too large")
 	}
+}
+
+func TestParseLeafMsgBadSize(t *testing.T) {
+	c := dummyClient()
+	c.kind = LEAF
+	c.leaf = &leaf{}
+	c.mpay = 16
+	require_Error(t, c.processLeafMsgArgs([]byte("foo 17")), ErrMaxPayload)
+}
+
+func TestParseLeafHeaderMsgBadSize(t *testing.T) {
+	c := dummyClient()
+	c.kind = LEAF
+	c.leaf = &leaf{}
+	c.mpay = 16
+	require_Error(t, c.processLeafHeaderMsgArgs([]byte("foo 4 17")), ErrMaxPayload)
 }
 
 func TestParseHeaderPub(t *testing.T) {
@@ -677,6 +697,94 @@ func TestParseMsgSpace(t *testing.T) {
 	}
 }
 
+func TestParsePingNoAuthUserExceptionsAndRestrictions(t *testing.T) {
+	opts := defaultServerOptions
+	s := New(&opts)
+	s.opts.NoAuthUser = "foo"
+	s.users = map[string]*User{
+		"foo": {Username: "foo"},
+	}
+
+	newAuthPendingClient := func(kind int, gw *gateway, route *route, leaf *leaf, ws *websocket) *client {
+		c := &client{
+			srv: s, kind: kind,
+			gw: gw, route: route, leaf: leaf, ws: ws,
+			atmr: time.AfterFunc(time.Minute, func() {}),
+		}
+		c.flags.set(expectConnect)
+		t.Cleanup(func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.clearAuthTimer()
+		})
+		return c
+	}
+
+	for _, test := range []struct {
+		name  string
+		kind  int
+		gw    *gateway
+		route *route
+		leaf  *leaf
+	}{
+		{name: "Leaf", kind: LEAF, leaf: &leaf{}},
+		{name: "Route", kind: ROUTER, route: &route{}},
+		{name: "Gateway", kind: GATEWAY, gw: &gateway{}},
+	} {
+		t.Run(test.name+"NotAllowed", func(t *testing.T) {
+			c := newAuthPendingClient(test.kind, test.gw, test.route, test.leaf, nil)
+			require_Error(t, c.parse([]byte("PING\r\n")), ErrAuthentication)
+			require_False(t, c.flags.isSet(connectReceived))
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		kind int
+		ws   *websocket
+	}{
+		{name: "Client", kind: CLIENT},
+		{name: "WebSocket", kind: CLIENT, ws: &websocket{}},
+	} {
+		t.Run(test.name+"Allowed", func(t *testing.T) {
+			c := newAuthPendingClient(test.kind, nil, nil, nil, test.ws)
+			require_NoError(t, c.parse([]byte("PING\r\n")))
+			require_True(t, c.flags.isSet(connectReceived))
+		})
+	}
+}
+
+func TestParsePingAllowedAfterConnectForNonClients(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		kind  int
+		gw    *gateway
+		route *route
+		leaf  *leaf
+	}{
+		{name: "Leaf", kind: LEAF, leaf: &leaf{}},
+		{name: "Route", kind: ROUTER, route: &route{}},
+		{name: "Gateway", kind: GATEWAY, gw: &gateway{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := &client{
+				srv: func() *Server {
+					opts := defaultServerOptions
+					return New(&opts)
+				}(),
+				kind:  test.kind,
+				gw:    test.gw,
+				route: test.route,
+				leaf:  test.leaf,
+			}
+			c.flags.set(connectReceived)
+
+			require_NoError(t, c.parse([]byte("PING\r\n")))
+			require_Equal(t, c.state, OP_START)
+		})
+	}
+}
+
 func TestShouldFail(t *testing.T) {
 	wrongProtos := []string{
 		"xxx",
@@ -869,6 +977,60 @@ func TestMaxControlLine(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Should not have failed, got %v", err)
 				}
+			}
+		})
+	}
+}
+
+func TestMaxControlLineNonClientUpperBound(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		kind int
+	}{
+		{"leaf", LEAF},
+		{"route", ROUTER},
+		{"gateway", GATEWAY},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			setupClient := func() *client {
+				c := dummyClient()
+				c.setNoReconnect()
+				c.flags.set(connectReceived)
+				c.kind = test.kind
+				switch test.kind {
+				case ROUTER:
+					c.route = &route{}
+				case GATEWAY:
+					c.gw = &gateway{outbound: false, connected: true, insim: make(map[string]*insie)}
+				}
+				// mcl is the CLIENT default; non-CLIENT uses 16 times that instead
+				c.mcl = MAX_CONTROL_LINE_SIZE
+				return c
+			}
+
+			for _, off := range []int{-1, 0, 1} {
+				t.Run(fmt.Sprintf("%d", off), func(t *testing.T) {
+					// Build a PUB arg that exceeds the max control line.
+					// Feed it in two chunks so argBuf accumulates across parse calls
+					// (replicates the split-buffer trickle-feed exploit path).
+					defaultMaxControlLineSize := MAX_CONTROL_LINE_SIZE * 16
+					subject := bytes.Repeat([]byte("x"), defaultMaxControlLineSize+off)
+					chunk1 := append([]byte("PUB "), subject[:defaultMaxControlLineSize/2]...)
+					chunk2 := subject[defaultMaxControlLineSize/2:]
+
+					c := setupClient()
+					// First chunk — no error expected yet (argBuf < limit)
+					if err := c.parse(chunk1); err != nil {
+						t.Fatalf("unexpected error on first chunk: %v", err)
+					}
+					// Second chunk pushes argBuf over max control line
+					err := c.parse(chunk2)
+					if off <= 0 && err != nil {
+						t.Fatalf("unexpected error on second chunk: %v", err)
+					} else if off > 0 && !ErrorIs(err, ErrMaxControlLine) {
+						t.Fatalf("expected ErrMaxControlLine after oversized accumulation, got: %v", err)
+					}
+				})
 			}
 		})
 	}

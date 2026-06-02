@@ -1638,14 +1638,14 @@ func TestClusterQueueGroupWeightTrackingLeak(t *testing.T) {
 		key := keyFromSubWithOrigin(&sub)
 		checkFor(t, time.Second, 15*time.Millisecond, func() error {
 			acc.mu.RLock()
-			v, ok := acc.lqws[key]
+			v, ok := acc.lws[key]
 			acc.mu.RUnlock()
 			if present {
 				if !ok {
 					return fmt.Errorf("the key is not present")
 				}
 				if v != expected {
-					return fmt.Errorf("lqws doest not contain expected value of %v: %v", expected, v)
+					return fmt.Errorf("lws does not contain expected value of %v: %v", expected, v)
 				}
 			} else if ok {
 				return fmt.Errorf("the key is present with value %v and should not be", v)
@@ -4440,6 +4440,56 @@ func TestRouteCustomPing(t *testing.T) {
 	}
 }
 
+func TestRouteCompressionStaleConnectionUsesClusterPingMax(t *testing.T) {
+	mockListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require_NoError(t, err)
+	defer mockListener.Close()
+	mockPort := mockListener.Addr().(*net.TCPAddr).Port
+
+	// The mock peer never sends INFO, so the soliciting route never completes
+	// compression negotiation. The connection can only be closed by the stale
+	// watch installed in createRoute.
+	connCh := make(chan net.Conn, 1)
+	go func() {
+		conn, err := mockListener.Accept()
+		if err != nil {
+			return
+		}
+		connCh <- conn
+	}()
+
+	// Cluster.MaxPingsOut and MaxPingsOut differ so the stale timer's deadline
+	// distinguishes which is used: 50ms*2 = 100ms vs 50ms*101 ≈ 5s.
+	o := DefaultOptions()
+	o.Cluster.Compression.Mode = CompressionS2Fast
+	o.Cluster.PingInterval = 50 * time.Millisecond
+	o.Cluster.MaxPingsOut = 1
+	o.MaxPingsOut = 100
+	o.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", mockPort))
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	var conn net.Conn
+	select {
+	case conn = <-connCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Mock listener did not accept route connection")
+	}
+	defer conn.Close()
+
+	require_NoError(t, conn.SetReadDeadline(time.Now().Add(1500*time.Millisecond)))
+	buf := make([]byte, 256)
+	start := time.Now()
+	for {
+		if _, err = conn.Read(buf); err != nil {
+			break
+		}
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Stale-connection timer used wrong ping_max: closed after %v, expected <1s (Cluster.MaxPingsOut=1)", elapsed)
+	}
+}
+
 func TestRouteNoLeakOnSlowConsumer(t *testing.T) {
 	o1 := DefaultOptions()
 	o1.Cluster.PoolSize = -1
@@ -4978,6 +5028,221 @@ func TestRouteImplicitJoinsSeparateGroups(t *testing.T) {
 	}
 }
 
+// Extra regression test for issue fixed via:
+//
+// https://github.com/nats-io/nats-server/commit/d5ef552ae46d7c284e4bfdf01211f97893b2f38f
+func TestRouteMsgWithManyHeadersDoesNotCorruptJSON(t *testing.T) {
+	tmpl := `
+		port: -1
+		server_name: "%s"
+		accounts {
+			A {
+				users: [ { user: a, password: pwd } ]
+				exports: [ { service: "svc.>" } ]
+			}
+			B {
+				users: [ { user: b, password: pwd } ]
+				imports: [ { service: { account: A, subject: "svc.>" } } ]
+			}
+		}
+		cluster {
+			name: "TEST"
+			port: -1
+			compression: s2_fast
+			%s
+		}
+	`
+	conf1 := createConfFile(t, []byte(fmt.Sprintf(tmpl, "S1", "")))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	conf2 := createConfFile(t, []byte(fmt.Sprintf(tmpl, "S2",
+		fmt.Sprintf("routes: [\"nats://127.0.0.1:%d\"]", o1.Cluster.Port))))
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	// Account A responder on S2 — the destination of the service import.
+	ncAResp := natsConnect(t, s2.ClientURL(), nats.UserInfo("a", "pwd"))
+	defer ncAResp.Close()
+	respCount := atomic.Int64{}
+	_, err := ncAResp.Subscribe("svc.>", func(m *nats.Msg) {
+		respCount.Add(1)
+	})
+	require_NoError(t, err)
+	require_NoError(t, ncAResp.Flush())
+
+	// Account B subscriber on S2 — receives over the route from S1.
+	ncB2 := natsConnect(t, s2.ClientURL(), nats.UserInfo("b", "pwd"))
+	defer ncB2.Close()
+	subB2, err := ncB2.SubscribeSync("svc.>")
+	require_NoError(t, err)
+	defer subB2.Unsubscribe()
+	require_NoError(t, subB2.SetPendingLimits(-1, -1))
+	require_NoError(t, ncB2.Flush())
+
+	checkSubInterest(t, s1, "A", "svc.foo", time.Second)
+	checkSubInterest(t, s1, "B", "svc.foo", time.Second)
+	checkSubInterest(t, s2, "B", "svc.foo", time.Second)
+
+	total := 3000
+	bodies := make([][]byte, total)
+	for i := 0; i < total; i++ {
+		filler := strings.Repeat("x", 32+rand.Intn(12*1024))
+		body := fmt.Sprintf(
+			`{"branch":"main","idx":%d,`+
+				`"some_tag":"tag-aaaaaaaaaaaaaaaaaaaaaaaa",`+
+				`"data":{"context":{"commit":"0123456789abcdef0123456789abcdef01234567",`+
+				`"scope":"api","filler":%q},`+
+				`"payload":{"client_ip_address":"2001:db8::1","seq":%d}}}`,
+			i, filler, i)
+		bodies[i] = []byte(body)
+	}
+
+	producers := 8
+	var pwg sync.WaitGroup
+	for p := 0; p < producers; p++ {
+		pwg.Add(1)
+		go func(p int) {
+			defer pwg.Done()
+			pnc := natsConnect(t, s1.ClientURL(), nats.UserInfo("b", "pwd"))
+			defer pnc.Close()
+			for i := p; i < total; i += producers {
+				m := nats.NewMsg(fmt.Sprintf("svc.%d", i%64))
+				m.Data = bodies[i]
+				// Many headers, varying sizes, in a mix that sorts before and after "Nats-Request-Info"
+				// so that it has both leading and trailing neighbors.
+				m.Header.Set("Idx", strconv.Itoa(i))
+				m.Header.Set("Nats-Msg-Id", fmt.Sprintf("msg-%06d", i))
+				// Extra header which will be removed on the fly.
+				m.Header.Set("Nats-Request-Info", `{"acc":"B","user":"b","host":"prefilled"}`)
+				m.Header.Set("Trace-Id", "trace-aaaaaaaaaaaaaaaaaaaaaaaa")
+				m.Header.Set("Span-Id", "span-bbbbbbbbbbbbbbbbbbbbbbbb")
+				m.Header.Set("Request-Id", "request-cccccccccccccccccccccccc")
+				m.Header.Set("Source-App", "test-app")
+				m.Header.Set("X-Filler", strings.Repeat("filler-", 16)+strconv.Itoa(rand.Int()))
+				m.Header.Set("X-Tail-Header", fmt.Sprintf("idx=%d-stable-tail-data", i))
+				if err := pnc.PublishMsg(m); err != nil {
+					t.Errorf("publish %d: %v", i, err)
+					return
+				}
+			}
+			_ = pnc.Flush()
+		}(p)
+	}
+	pwg.Wait()
+
+	seen := make(map[int]bool, total)
+	deadline := time.Now().Add(120 * time.Second)
+	for len(seen) < total {
+		if time.Now().After(deadline) {
+			t.Fatalf("subB2: timed out: got %d/%d", len(seen), total)
+		}
+		m, err := subB2.NextMsg(2 * time.Second)
+		if err != nil {
+			continue
+		}
+		var parsed struct {
+			Branch string `json:"branch"`
+			Idx    int    `json:"idx"`
+			Tag    string `json:"some_tag"`
+			Data   struct {
+				Context struct {
+					Commit string `json:"commit"`
+					Scope  string `json:"scope"`
+					Filler string `json:"filler"`
+				} `json:"context"`
+				Payload struct {
+					ClientIPAddress string `json:"client_ip_address"`
+					Seq             int    `json:"seq"`
+				} `json:"payload"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(m.Data, &parsed); err != nil {
+			t.Fatalf("subB2 json.Unmarshal failed: %v: data[:256]=%q",
+				err, m.Data[:min(256, len(m.Data))])
+		}
+		// Ensure all headers are still present.
+		idxStr := m.Header.Get("Idx")
+		if idxStr == "" {
+			keys := make([]string, 0, len(m.Header))
+			for k := range m.Header {
+				keys = append(keys, k)
+			}
+			t.Fatalf("subB2: received message with no/empty Idx header (corruption): subj=%s data[:128]=%q allHeaderKeys=%v",
+				m.Subject, m.Data[:min(128, len(m.Data))], keys)
+		}
+		// Detect garbage header keys (e.g., 'c"' from leftover '"acc":"B"...')
+		// and silently dropped expected keys.
+		expectedKeys := map[string]bool{
+			"Idx": true, "Nats-Msg-Id": true, "Nats-Request-Info": true,
+			"Trace-Id": true, "Span-Id": true, "Request-Id": true,
+			"Source-App": true, "X-Filler": true, "X-Tail-Header": true,
+		}
+		gotKeys := make(map[string]bool, len(m.Header))
+		for k := range m.Header {
+			gotKeys[k] = true
+		}
+		for k := range gotKeys {
+			if !expectedKeys[k] {
+				keys := make([]string, 0, len(gotKeys))
+				for kk := range gotKeys {
+					keys = append(keys, kk)
+				}
+				t.Fatalf("subB2 idx=%s: unexpected header key %q (corruption); allKeys=%v",
+					idxStr, k, keys)
+			}
+		}
+		for k := range expectedKeys {
+			if !gotKeys[k] {
+				keys := make([]string, 0, len(gotKeys))
+				for kk := range gotKeys {
+					keys = append(keys, kk)
+				}
+				t.Fatalf("subB2 idx=%s: expected header key %q missing (corruption); allKeys=%v",
+					idxStr, k, keys)
+			}
+		}
+		idx, err := strconv.Atoi(idxStr)
+		require_NoError(t, err)
+		// Bounds check so corruption that rewrites Idx to an out-of-range value
+		// cannot inflate len(seen) and produce a false negative.
+		if idx < 0 || idx >= total {
+			t.Fatalf("subB2: Idx header out of range (corruption): idx=%d total=%d data[:128]=%q",
+				idx, total, m.Data[:min(128, len(m.Data))])
+		}
+
+		// Check that parsed JSON contains the expected data.
+		if parsed.Idx != idx {
+			t.Fatalf("subB2 idx=%d: parsed idx mismatch got=%d", idx, parsed.Idx)
+		}
+		if parsed.Data.Payload.Seq != idx {
+			t.Fatalf("subB2 idx=%d: parsed payload.seq mismatch got=%d", idx, parsed.Data.Payload.Seq)
+		}
+		// Headers should round-trip intact.
+		if got := m.Header.Get("Idx"); got != idxStr {
+			t.Fatalf("subB2 idx=%d: Idx header corrupted, got=%q", idx, got)
+		}
+		if got := m.Header.Get("Nats-Msg-Id"); got != fmt.Sprintf("msg-%06d", idx) {
+			t.Fatalf("subB2 idx=%d: Nats-Msg-Id corrupted, got=%q", idx, got)
+		}
+		wantTail := fmt.Sprintf("idx=%d-stable-tail-data", idx)
+		if got := m.Header.Get("X-Tail-Header"); got != wantTail {
+			t.Fatalf("subB2 idx=%d: X-Tail-Header corrupted, got=%q want=%q", idx, got, wantTail)
+		}
+		seen[idx] = true
+	}
+
+	// Check that all messages were received.
+	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+		if got := respCount.Load(); got != int64(total) {
+			return fmt.Errorf("Account A responder: got %d/%d messages", got, total)
+		}
+		return nil
+	})
+}
+
 func TestRouteConfigureWriteDeadline(t *testing.T) {
 	o1, o2 := DefaultOptions(), DefaultOptions()
 
@@ -5037,5 +5302,357 @@ func TestRouteConfigureWriteTimeoutPolicy(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+func TestRoutePoolFirstPongBlocksChain(t *testing.T) {
+	// Use a very short ping interval so the timer fires quickly, before we (the mock server) send our INFO.
+	orgMaxPing := routeMaxPingInterval
+	routeMaxPingInterval = 200 * time.Millisecond
+	defer func() { routeMaxPingInterval = orgMaxPing }()
+
+	// Start a TCP listener acting as a mock route server. S2 will solicit a connection to this listener.
+	mockListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require_NoError(t, err)
+	defer mockListener.Close()
+
+	mockPort := mockListener.Addr().(*net.TCPAddr).Port
+
+	o2 := DefaultOptions()
+	o2.ServerName = "S2"
+	o2.Cluster.Name = "local"
+	o2.Cluster.PoolSize = 3
+	o2.Cluster.Compression.Mode = CompressionOff
+	o2.Cluster.MaxPingsOut = 10
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", mockPort))
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	var ready sync.WaitGroup
+	var keepAlive sync.WaitGroup
+	mockListener.(*net.TCPListener).SetDeadline(time.Now().Add(5 * time.Second))
+	handleConnection := func() {
+		conn, err := mockListener.Accept()
+		if err != nil {
+			ready.Done()
+			require_NoError(t, err)
+		}
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+
+		// Ensure we call these before conn.Close() above.
+		// We have to wait for both connections to be ready and then wait for the test to finish.
+		defer keepAlive.Wait()
+		defer ready.Done()
+
+		// S2 sends CONNECT immediately (solicited route).
+		// Read it but do NOT send our INFO yet — we want S2's timer to fire first.
+		require_NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+
+		// Read S2's CONNECT line.
+		line, err := br.ReadString('\n')
+		require_NoError(t, err)
+		require_True(t, strings.HasPrefix(line, "CONNECT"))
+
+		// Wait for S2's timer PING to arrive.
+		// The readLoop on S2 is blocked waiting for our INFO, so the
+		// timer goroutine enqueues the PING on S2's outbound buffer.
+		checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+			if _, err = conn.Write([]byte("PING\r\n")); err != nil {
+				return err
+			}
+			if line, err = br.ReadString('\n'); err != nil {
+				return err
+			}
+			t.Logf("S2 received: %q", line)
+			if !strings.HasPrefix(line, "PING") {
+				return fmt.Errorf("expected PING, got %q", line)
+			}
+			return nil
+		})
+
+		// Respond with PONG — this sets firstPong on S2's route connection
+		// BEFORE addRoute has run (since we haven't sent INFO yet).
+		_, err = conn.Write([]byte("PONG\r\n"))
+		require_NoError(t, err)
+
+		// NOW send our INFO. This triggers S2's processRouteInfo → addRoute,
+		// which sets startNewRoute and sends another PING.
+		mockInfo := Info{
+			ID:            "MOCK_SERVER_ID",
+			Name:          "mock-server",
+			Host:          "127.0.0.1",
+			Port:          mockPort,
+			Cluster:       "local",
+			Headers:       true,
+			Proto:         1,
+			RoutePoolSize: 3,
+		}
+		infoJSON, err := json.Marshal(mockInfo)
+		require_NoError(t, err)
+		_, err = fmt.Fprintf(conn, "INFO %s\r\n", infoJSON)
+		require_NoError(t, err)
+
+		// Read S2's delayed INFO (sent during addRoute) + subscription data + PING.
+		// We need to consume everything up to and including the PING.
+		for {
+			line, err = br.ReadString('\n')
+			require_NoError(t, err)
+			if strings.HasPrefix(line, "PING") {
+				break
+			}
+		}
+
+		// Respond to addRoute's PING with PONG.
+		_, err = conn.Write([]byte("PONG\r\n"))
+		require_NoError(t, err)
+	}
+
+	// Keep the below connections alive until the test is done.
+	// This allows us to check that S2 creates the next pool connection.
+	keepAlive.Add(1)
+	defer keepAlive.Done()
+
+	ready.Add(2)
+	for range 2 {
+		go handleConnection()
+	}
+	ready.Wait()
+
+	// Check if S2 attempts to create a second pool connection by
+	// trying to accept another connection on our mock listener.
+	secondConnCh := make(chan struct{}, 1)
+	go func() {
+		mockListener.(*net.TCPListener).SetDeadline(time.Now().Add(2 * time.Second))
+		if c2, err := mockListener.Accept(); err == nil {
+			c2.Close()
+			secondConnCh <- struct{}{}
+		}
+	}()
+
+	select {
+	case <-secondConnCh:
+		// Good — S2 tried to create the next pool connection.
+		// The fix works: startNewRoute was consumed despite firstPong.
+	case <-time.After(2 * time.Second):
+		t.Fatalf("S2 did not attempt to create next pool connection; " +
+			"firstPong blocked startNewRoute consumption, pool chain is broken")
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/8233
+func TestRouteSubUnsubRaceLosesRemoteInterest(t *testing.T) {
+	oa := DefaultOptions()
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	ob := DefaultOptions()
+	ob.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", oa.Cluster.Port))
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	checkClusterFormed(t, sa, sb)
+
+	// A client on node B, used to confirm the user-visible symptom: a request to
+	// the subject gets "no responders" even though a live responder exists on A.
+	ncReq := natsConnect(t, sb.ClientURL())
+	defer ncReq.Close()
+
+	// Many subjects raced at once so they all contend the same global-account
+	// acc.mu and the single pinned A->B route.mu.
+	const (
+		conns = 100
+		waves = 10
+	)
+
+	// Connection pools, reused across waves. ncMinus owns the original subscription
+	// that gets removed, ncPlus adds the new responder that must survive. They are
+	// distinct connections so their operations run on different readLoop goroutines
+	// on node A and can race.
+	ncMinus := make([]*nats.Conn, conns)
+	ncPlus := make([]*nats.Conn, conns)
+	for i := 0; i < conns; i++ {
+		ncMinus[i] = natsConnect(t, sa.ClientURL())
+		defer ncMinus[i].Close()
+		ncPlus[i] = natsConnect(t, sa.ClientURL())
+		defer ncPlus[i].Close()
+	}
+
+	accB := sb.globalAccount()
+	for w := range waves {
+		subjects := make([]string, conns)
+		minusSubs := make([]*nats.Subscription, conns)
+		for i := range conns {
+			subjects[i] = fmt.Sprintf("foo.%d.%d", w, i)
+			// Original interest, mirrored to B via RS+. This is the "live"
+			// subscription on B that makes the reordered RS+ a no-op.
+			minusSubs[i] = natsSubSync(t, ncMinus[i], subjects[i])
+		}
+		for i := range conns {
+			natsFlush(t, ncMinus[i])
+		}
+		// Make sure B sees all of the original interest before we start, so its
+		// route already tracks each key.
+		for i := range conns {
+			checkSubInterest(t, sb, globalAccountName, subjects[i], 5*time.Second)
+		}
+
+		// Fire the wave: for each subject, simultaneously remove the original
+		// interest (-1) and add a replacement responder (+1) on node A.
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2 * conns)
+		for i := range conns {
+			go func() {
+				defer wg.Done()
+				<-start
+				minusSubs[i].Unsubscribe()
+				ncMinus[i].Flush()
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				ncPlus[i].Subscribe(subjects[i], func(m *nats.Msg) {
+					m.Respond([]byte("ok"))
+				})
+				ncPlus[i].Flush()
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		// Barrier: subscribe a marker on the same (pinned) route and wait for B
+		// to observe it. Because all of the wave's RS+/RS- protos were enqueued
+		// on that same route connection before this one, FIFO ordering
+		// guarantees that once B has the marker it has processed every proto
+		// from the wave.
+		marker := fmt.Sprintf("marker.%d", w)
+		natsSubSync(t, ncPlus[0], marker)
+		natsFlush(t, ncPlus[0])
+		checkSubInterest(t, sb, globalAccountName, marker, 5*time.Second)
+
+		// Every subject still has a live local responder on A (the ncPlus sub),
+		// so B must still have interest. If the race fired, B silently lost it.
+		for i := range conns {
+			if accB.SubscriptionInterest(subjects[i]) {
+				continue
+			}
+			// Confirm the exact reported symptom: a request from a client on B
+			// gets "no responders" although A has a live responder.
+			_, rerr := ncReq.Request(subjects[i], []byte("ping"), time.Second)
+			t.Fatalf("wave %d: node B lost interest in %q while node A still has a "+
+				"live local responder; request from B returned %v (want a reply). "+
+				"RS+/RS- were reordered on the A->B route by the "+
+				"updateRouteSubscriptionMap race", w, subjects[i], rerr)
+		}
+	}
+}
+
+// Benchmarks for message arg processing functions to measure heap allocations.
+// These functions parse incoming protocol messages and split arguments.
+
+func BenchmarkProcessRoutedMsgArgs(b *testing.B) {
+	// RMSG format: account subject [reply] size
+	arg := []byte("$G foo.bar _INBOX.xxx 1024")
+	c := &client{kind: ROUTER, route: &route{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processRoutedMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessRoutedHeaderMsgArgs(b *testing.B) {
+	// HMSG format: account subject [reply] headerSize totalSize
+	arg := []byte("$G foo.bar 12 1024")
+	c := &client{kind: ROUTER, route: &route{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processRoutedHeaderMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessRoutedOriginClusterMsgArgs(b *testing.B) {
+	// Origin cluster HMSG format: origin account subject [reply] headerSize totalSize
+	arg := []byte("ORIGIN MY_ACCOUNT foo.bar 12 345")
+	c := &client{kind: ROUTER, route: &route{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processRoutedOriginClusterMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessLeafMsgArgs(b *testing.B) {
+	// LMSG format: subject [reply] size
+	arg := []byte("foo.bar _INBOX.xxx 1024")
+	c := &client{kind: LEAF}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processLeafMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessLeafHeaderMsgArgs(b *testing.B) {
+	// Leaf HMSG format: subject headerSize totalSize
+	arg := []byte("foo.bar 12 1024")
+	c := &client{kind: LEAF}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processLeafHeaderMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Benchmarks with queue subscribers to exercise the larger arg paths.
+
+func BenchmarkProcessRoutedMsgArgs_Queues(b *testing.B) {
+	// RMSG format with queues: account subject replyIndicator reply queue1 queue2 size
+	arg := []byte("$G foo.bar + _INBOX.xxx queue1 queue2 1024")
+	c := &client{kind: ROUTER, route: &route{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processRoutedMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessRoutedHeaderMsgArgs_Queues(b *testing.B) {
+	// HMSG format with queues: account subject replyIndicator reply queue1 queue2 headerSize totalSize
+	arg := []byte("$G foo.bar + _INBOX.xxx queue1 queue2 12 1024")
+	c := &client{kind: ROUTER, route: &route{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processRoutedHeaderMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessLeafMsgArgs_Queues(b *testing.B) {
+	// LMSG format with queues: subject replyIndicator reply queue1 queue2 size
+	arg := []byte("foo.bar + _INBOX.xxx queue1 queue2 1024")
+	c := &client{kind: LEAF}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processLeafMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

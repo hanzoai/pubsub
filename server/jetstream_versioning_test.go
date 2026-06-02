@@ -107,6 +107,11 @@ func TestJetStreamSetStaticStreamMetadata(t *testing.T) {
 			cfg:              &StreamConfig{PersistMode: AsyncPersistMode},
 			expectedMetadata: metadataAtLevel("2"),
 		},
+		{
+			desc:             "AllowBatchPublish",
+			cfg:              &StreamConfig{AllowBatchPublish: true},
+			expectedMetadata: metadataAtLevel("4"),
+		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
 			setStaticStreamMetadata(test.cfg)
@@ -248,6 +253,11 @@ func TestJetStreamSetStaticConsumerMetadata(t *testing.T) {
 			desc:             "Pinned",
 			cfg:              &ConsumerConfig{PriorityPolicy: PriorityPinnedClient, PriorityGroups: []string{"a"}},
 			expectedMetadata: metadataAtLevel("1"),
+		},
+		{
+			desc:             "AckFlowControl",
+			cfg:              &ConsumerConfig{AckPolicy: AckFlowControl},
+			expectedMetadata: metadataAtLevel("4"),
 		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
