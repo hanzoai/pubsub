@@ -2469,7 +2469,7 @@ func TestNoRaceJetStreamClusterMirrorSkipSequencingBug(t *testing.T) {
 		si, err := js.StreamInfo("M")
 		require_NoError(t, err)
 		if si.State.Msgs != 500_000 {
-			return fmt.Errorf("Expected 1M msgs, got state: %+v", si.State)
+			return fmt.Errorf("Expected 500k msgs, got state: %+v", si.State)
 		}
 		return nil
 	})
@@ -2939,7 +2939,7 @@ func TestNoRaceStoreReverseWalkWithDeletesPerf(t *testing.T) {
 		require_Equal(t, ss.Msgs, 1_000_002)
 
 		// Create a bunch of interior deletes.
-		p, err := store.PurgeEx("foo.B", 1, 0)
+		p, err := store.PurgeEx("foo.B", 0, 0)
 		require_NoError(t, err)
 		require_Equal(t, p, 1_000_000)
 
@@ -2972,7 +2972,7 @@ func TestNoRaceStoreReverseWalkWithDeletesPerf(t *testing.T) {
 		seq, seen := ss.LastSeq, 0
 		start = time.Now()
 		for {
-			sm, err := store.LoadPrevMsg(seq, &smv)
+			sm, _, err := store.LoadPrevMsg(_EMPTY_, false, seq, &smv)
 			if err == ErrStoreEOF {
 				break
 			}
@@ -3509,4 +3509,101 @@ func TestNoRaceAccessTimeLeakCheck(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestNoRaceQuickMultipleConfigReloadRemoteLeafNoDuplicate(t *testing.T) {
+	// This test is to demonstrate that if we perform quicj disable/enable,
+	// or remove/add of remote leafnodes, we don't end up with multiple
+	// "connect to remote" go routines for the same remote, leading to duplicate
+	// remote leafnodes.
+
+	conf1 := createConfFile(t, []byte(`
+		port: -1
+		server_name: "A"
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+	`))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+	l := &captureErrorLogger{errCh: make(chan string, 100)}
+	s1.SetLogger(l, false, false)
+
+	tmpl2 := `
+		port: -1
+		server_name: "B"
+		leafnodes {
+			reconnect_interval: "50ms"
+			remotes [
+				%s
+			]
+		}
+	`
+
+	configWithAdded := fmt.Appendf(nil, tmpl2,
+		fmt.Sprintf(`{url: "nats://127.0.0.1:%d"}`, o1.LeafNode.Port))
+	configWithRemoved := fmt.Appendf(nil, tmpl2, _EMPTY_)
+	configWithDisabled := fmt.Appendf(nil, tmpl2,
+		fmt.Sprintf(`{url: "nats://127.0.0.1:%d", disabled: true}`, o1.LeafNode.Port))
+	configWithEnabled := fmt.Appendf(nil, tmpl2,
+		fmt.Sprintf(`{url: "nats://127.0.0.1:%d", disabled: false}`, o1.LeafNode.Port))
+
+	conf2 := createConfFile(t, configWithEnabled)
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	checkLeafNodeConnectedCount(t, s2, 1)
+
+	for _, test := range []struct {
+		name     string
+		disabled bool
+	}{
+		{"disabled_enabled", true},
+		{"removed_added", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var disabledOrRemoved bool
+			// We pick a number that will end the loop with enabled/added remote.
+			for range 20 {
+				disabledOrRemoved = !disabledOrRemoved
+				var config []byte
+				if test.disabled {
+					if disabledOrRemoved {
+						config = configWithDisabled
+					} else {
+						config = configWithEnabled
+					}
+				} else {
+					if disabledOrRemoved {
+						config = configWithRemoved
+					} else {
+						config = configWithAdded
+					}
+				}
+				err := os.WriteFile(conf2, config, 0666)
+				require_NoError(t, err)
+				deadline := time.Now().Add(1500 * time.Millisecond)
+				for time.Now().Before(deadline) {
+					err = s2.Reload()
+					if err == nil || !strings.Contains(err.Error(), "try again") {
+						break
+					}
+				}
+				require_NoError(t, err)
+			}
+			checkLeafNodeConnectedCount(t, s2, 1)
+
+			for {
+				select {
+				case errTxt := <-l.errCh:
+					if strings.Contains(errTxt, DuplicateRemoteLeafnodeConnection.String()) {
+						t.Fatalf("Duplicates detected: %s", errTxt)
+					}
+				default:
+					// No error, all ok!
+					return
+				}
+			}
+		})
+	}
 }

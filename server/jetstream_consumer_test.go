@@ -25,7 +25,8 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
-	"os"
+	os "os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"slices"
@@ -2893,15 +2894,10 @@ func TestJetStreamConsumerMessageDeletedDuringRedelivery(t *testing.T) {
 			o.adflr, o.asflr = 0, 0
 			o.dseq, o.sseq = 11, 11
 
-			// Getting the next message should skip seq 2, as that's deleted, but must not touch state.
+			// Getting the next message should skip seq 2, as that's deleted. Should clean up the state.
 			_, _, err = o.getNextMsg()
 			o.mu.Unlock()
 			require_Error(t, err, ErrStoreEOF)
-			require_Len(t, len(o.pending), 1)
-
-			// Simulate the o.processTerm goroutine running after a call to o.getNextMsg.
-			// Pending state and delivery/ack floors should be corrected.
-			o.processTerm(2, 2, 1, ackTermUnackedLimitsReason, _EMPTY_)
 
 			o.mu.RLock()
 			defer o.mu.RUnlock()
@@ -3208,7 +3204,7 @@ func TestJetStreamConsumerWithStartTime(t *testing.T) {
 
 			msg, err := nc.Request(o.requestNextMsgSubject(), nil, time.Second)
 			require_NoError(t, err)
-			sseq, dseq, _, _, _ := replyInfo(msg.Reply)
+			sseq, dseq, _, _, _ := ackReplyInfo(msg.Reply)
 			if dseq != 1 {
 				t.Fatalf("Expected delivered seq of 1, got %d", dseq)
 			}
@@ -3960,7 +3956,7 @@ func TestJetStreamConsumerDurableReconnectWithOnlyPending(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
 				}
-				sseq, _, dc, _, _ := replyInfo(msg.Reply)
+				sseq, _, dc, _, _ := ackReplyInfo(msg.Reply)
 				if sseq == 1 && dc == 1 {
 					t.Fatalf("Expected a redelivery count greater then 1 for sseq 1, got %d", dc)
 				}
@@ -4039,7 +4035,7 @@ func TestJetStreamConsumerDurableFilteredSubjectReconnect(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
 				}
-				rsseq, roseq, dcount, _, _ := replyInfo(m.Reply)
+				rsseq, roseq, dcount, _, _ := ackReplyInfo(m.Reply)
 				if roseq != uint64(seq) {
 					t.Fatalf("Expected consumer sequence of %d , got %d", seq, roseq)
 				}
@@ -4058,7 +4054,7 @@ func TestJetStreamConsumerDurableFilteredSubjectReconnect(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
 				}
-				_, roseq, dcount, _, _ := replyInfo(m.Reply)
+				_, roseq, dcount, _, _ := ackReplyInfo(m.Reply)
 				if roseq != uint64(seq) {
 					t.Fatalf("Expected consumer sequence of %d , got %d", seq, roseq)
 				}
@@ -4829,7 +4825,7 @@ func TestJetStreamConsumerUpdateRedelivery(t *testing.T) {
 				DeliverSubject: sub.Subject,
 				FilterSubject:  "foo.bar",
 				AckPolicy:      AckExplicit,
-				AckWait:        100 * time.Millisecond,
+				AckWait:        500 * time.Millisecond,
 				MaxDeliver:     3,
 			})
 			if err != nil {
@@ -4853,7 +4849,7 @@ func TestJetStreamConsumerUpdateRedelivery(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Error getting message: %v", err)
 				}
-				seq, _, _, _, _ := replyInfo(m.Reply)
+				seq, _, _, _, _ := ackReplyInfo(m.Reply)
 				// 4, 8, 12, 16, 20
 				if seq%4 == 0 {
 					m.Respond(nil)
@@ -4886,7 +4882,7 @@ func TestJetStreamConsumerUpdateRedelivery(t *testing.T) {
 				DeliverSubject: sub.Subject,
 				FilterSubject:  "foo.bar",
 				AckPolicy:      AckExplicit,
-				AckWait:        100 * time.Millisecond,
+				AckWait:        500 * time.Millisecond,
 				MaxDeliver:     3,
 			})
 			if err != nil {
@@ -4911,7 +4907,7 @@ func TestJetStreamConsumerUpdateRedelivery(t *testing.T) {
 				if eseq <= uint64(toSend) && eseq%4 == 0 {
 					eseq++
 				}
-				seq, _, dc, _, _ := replyInfo(m.Reply)
+				seq, _, dc, _, _ := ackReplyInfo(m.Reply)
 				if seq != eseq {
 					t.Fatalf("Expected stream sequence of %d, got %d", eseq, seq)
 				}
@@ -4929,7 +4925,7 @@ func TestJetStreamConsumerUpdateRedelivery(t *testing.T) {
 
 			// We should get the second half back since we did not ack those from above.
 			expect = toSend - 5
-			checkFor(t, time.Second, 5*time.Millisecond, func() error {
+			checkFor(t, 5*time.Second, 5*time.Millisecond, func() error {
 				if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != expect {
 					return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, expect)
 				}
@@ -4945,7 +4941,7 @@ func TestJetStreamConsumerUpdateRedelivery(t *testing.T) {
 				if eseq <= uint64(toSend) && eseq%4 == 0 {
 					eseq++
 				}
-				seq, _, dc, _, _ := replyInfo(m.Reply)
+				seq, _, dc, _, _ := ackReplyInfo(m.Reply)
 				if seq != eseq {
 					t.Fatalf("Expected stream sequence of %d, got %d", eseq, seq)
 				}
@@ -5234,7 +5230,7 @@ func TestJetStreamConsumerPullMaxAckPendingRedeliveries(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
 				}
-				sseq, dseq, dcount, _, pending := replyInfo(m.Reply)
+				sseq, dseq, dcount, _, pending := ackReplyInfo(m.Reply)
 				if sseq != expSeq {
 					t.Fatalf("Expected stream sequence of %d, got %d", expSeq, sseq)
 				}
@@ -8066,6 +8062,39 @@ func TestJetStreamConsumerPauseResumeViaEndpoint(t *testing.T) {
 	require_False(t, getConsumerInfo().Paused)
 }
 
+func TestJetStreamConsumerPauseMetadataRace(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "CONSUMER"})
+	require_NoError(t, err)
+
+	const concurrency = 32
+	const iterations = 50
+	deadline := time.Now().Add(time.Minute)
+
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				jsTestPause_PauseConsumer(t, nc, "TEST", "CONSUMER", deadline)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 func TestJetStreamConsumerPauseHeartbeats(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -8410,7 +8439,7 @@ func TestJetStreamConsumerPullRemoveInterest(t *testing.T) {
 
 	msg, err := nc.Request(rqn, nil, time.Second)
 	require_NoError(t, err)
-	_, dseq, dc, _, _ := replyInfo(msg.Reply)
+	_, dseq, dc, _, _ := ackReplyInfo(msg.Reply)
 	if dseq != 1 {
 		t.Fatalf("Expected consumer sequence of 1, got %d", dseq)
 	}
@@ -8434,7 +8463,7 @@ func TestJetStreamConsumerPullRemoveInterest(t *testing.T) {
 
 	msg, err = nc.Request(rqn, nil, time.Second)
 	require_NoError(t, err)
-	_, dseq, dc, _, _ = replyInfo(msg.Reply)
+	_, dseq, dc, _, _ = ackReplyInfo(msg.Reply)
 	if dseq != 2 {
 		t.Fatalf("Expected consumer sequence of 2, got %d", dseq)
 	}
@@ -9532,7 +9561,7 @@ func TestJetStreamConsumerPullMaxBytes(t *testing.T) {
 	require_NoError(t, err)
 
 	// Put in ~2MB, each ~100k
-	msz, dsz := 100_000, 99_950
+	msz, dsz := 100_000, 99_900
 	total, msg := 20, []byte(strings.Repeat("Z", dsz))
 
 	for i := 0; i < total; i++ {
@@ -10277,6 +10306,20 @@ func TestJetStreamConsumerPrioritized(t *testing.T) {
 		return sub
 	}
 
+	// Pull requests are registered asynchronously, wait for the expected number
+	// of waiting requests before publishing so delivery can't race registration.
+	waitForNWaiting := func(t *testing.T, n int) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			o.mu.RLock()
+			defer o.mu.RUnlock()
+			if got := o.waiting.len(); got != n {
+				return fmt.Errorf("expected %d waiting requests, got %d", n, got)
+			}
+			return nil
+		})
+	}
+
 	t.Run("invalid priority number", func(t *testing.T) {
 
 		sub := sendPullRequest(t, "invalid_priority", 10, 1)
@@ -10299,8 +10342,8 @@ func TestJetStreamConsumerPrioritized(t *testing.T) {
 		priority1 := sendPullRequest(t, "priority1", 1, 1) // Priority 1 (should be served first)
 		priority2 := sendPullRequest(t, "priority2", 2, 2) // Priority 2
 
-		// Small delay to ensure requests are processed
-		time.Sleep(50 * time.Millisecond)
+		// Make sure all requests are registered before publishing.
+		waitForNWaiting(t, 3)
 
 		_, err = js.Publish("foo", fmt.Appendf(nil, "message"))
 		require_NoError(t, err)
@@ -10355,6 +10398,7 @@ func TestJetStreamConsumerPrioritized(t *testing.T) {
 
 		inbox3 := nats.NewInbox()
 		sub3 := sendPullRequest(t, inbox3, 3, 3)
+		waitForNWaiting(t, 1)
 
 		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
 		require_NoError(t, err)
@@ -10367,6 +10411,7 @@ func TestJetStreamConsumerPrioritized(t *testing.T) {
 		// with a lower priority should be able to take over the delivery.
 		inbox2 := nats.NewInbox()
 		sub2 := sendPullRequest(t, inbox2, 2, 2)
+		waitForNWaiting(t, 2)
 
 		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
 		require_NoError(t, err)
@@ -10378,6 +10423,7 @@ func TestJetStreamConsumerPrioritized(t *testing.T) {
 		// The same should happen with priority 1.
 		inbox1 := nats.NewInbox()
 		sub1 := sendPullRequest(t, inbox1, 1, 1) // Priority 1, batch 3
+		waitForNWaiting(t, 3)
 
 		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
 		require_NoError(t, err)
