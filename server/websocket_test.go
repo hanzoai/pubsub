@@ -73,9 +73,9 @@ func TestWSGet(t *testing.T) {
 
 	for _, test := range []struct {
 		name   string
-		pos    int
-		needed int
-		newpos int
+		pos    uint64
+		needed uint64
+		newpos uint64
 		trmax  int
 		result string
 		reterr bool
@@ -335,7 +335,7 @@ func testWSSetupForRead() (*client, *wsReadInfo, *testReader) {
 	opts := DefaultOptions()
 	opts.MaxPending = MAX_PENDING_SIZE
 	s := &Server{opts: opts}
-	c := &client{srv: s, ws: &websocket{}}
+	c := &client{srv: s, acc: s.gacc, ws: &websocket{}}
 	c.initClient()
 	return c, ri, tr
 }
@@ -405,88 +405,6 @@ func TestWSReadUncompressedFrames(t *testing.T) {
 	}
 	if string(bufs[0]) != "message" {
 		t.Fatalf("Unexpected content: %q", bufs[0])
-	}
-}
-
-func TestWSReadCompressedFrames(t *testing.T) {
-	c, ri, tr := testWSSetupForRead()
-	uncompressed := []byte("this is the uncompress data")
-	wsmsg1 := testWSCreateClientMsg(wsBinaryMessage, 1, true, true, uncompressed)
-	rb := append([]byte(nil), wsmsg1...)
-	// Call with some but not all of the payload
-	bufs, err := c.wsRead(ri, tr, rb[:10])
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if n := len(bufs); n != 0 {
-		t.Fatalf("Unexpected buffer returned: %v", n)
-	}
-	// Call with the rest, only then should we get the uncompressed data.
-	bufs, err = c.wsRead(ri, tr, rb[10:])
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if n := len(bufs); n != 1 {
-		t.Fatalf("Unexpected buffer returned: %v", n)
-	}
-	if !bytes.Equal(bufs[0], uncompressed) {
-		t.Fatalf("Unexpected content: %s", bufs[0])
-	}
-	// Stress the fact that we use a pool and want to make sure
-	// that if we get a decompressor from the pool, it is properly reset
-	// with the buffer to decompress.
-	// Since we unmask the read buffer, reset it now and fill it
-	// with 10 compressed frames.
-	rb = nil
-	for i := 0; i < 10; i++ {
-		rb = append(rb, wsmsg1...)
-	}
-	bufs, err = c.wsRead(ri, tr, rb)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if n := len(bufs); n != 10 {
-		t.Fatalf("Unexpected buffer returned: %v", n)
-	}
-
-	// Compress a message and send it in several frames.
-	buf := &bytes.Buffer{}
-	compressor, _ := flate.NewWriter(buf, 1)
-	compressor.Write(uncompressed)
-	compressor.Flush()
-	compressed := buf.Bytes()
-	// The last 4 bytes are dropped
-	compressed = compressed[:len(compressed)-4]
-	ncomp := 10
-	frag1 := testWSCreateClientMsg(wsBinaryMessage, 1, false, false, compressed[:ncomp])
-	frag1[0] |= wsRsv1Bit
-	frag2 := testWSCreateClientMsg(wsBinaryMessage, 2, true, false, compressed[ncomp:])
-	rb = append([]byte(nil), frag1...)
-	rb = append(rb, frag2...)
-	bufs, err = c.wsRead(ri, tr, rb)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if n := len(bufs); n != 1 {
-		t.Fatalf("Unexpected buffer returned: %v", n)
-	}
-	if !bytes.Equal(bufs[0], uncompressed) {
-		t.Fatalf("Unexpected content: %s", bufs[0])
-	}
-}
-
-func TestWSReadCompressedFrameCorrupted(t *testing.T) {
-	c, ri, tr := testWSSetupForRead()
-	uncompressed := []byte("this is the uncompress data")
-	wsmsg1 := testWSCreateClientMsg(wsBinaryMessage, 1, true, true, uncompressed)
-	copy(wsmsg1[10:], []byte{1, 2, 3, 4})
-	rb := append([]byte(nil), wsmsg1...)
-	bufs, err := c.wsRead(ri, tr, rb)
-	if err == nil || !strings.Contains(err.Error(), "corrupt") {
-		t.Fatalf("Expected error about corrupted data, got %v", err)
-	}
-	if n := len(bufs); n != 0 {
-		t.Fatalf("Expected no buffer, got %v", n)
 	}
 }
 
@@ -797,23 +715,20 @@ func TestWSCloseFrameWithPartialOrInvalid(t *testing.T) {
 	// Make the io reader return the rest of the frame
 	tr.buf = closeMsg[1:]
 	bufs, err = c.wsRead(ri, tr, closeFirtByte[:])
-	// It is expected that wsRead returns io.EOF on processing a close.
-	if err != io.EOF {
+	if err == nil || !strings.Contains(err.Error(), "close frame payload cannot be 1 byte") {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	if n := len(bufs); n != 0 {
 		t.Fatalf("Unexpected buffer returned: %v", n)
 	}
-	// Since no status was received, the server will send a close frame without
-	// status code nor payload.
 	c.mu.Lock()
 	nb, _ = c.collapsePtoNB()
 	c.mu.Unlock()
 	if n := len(nb); n == 0 {
 		t.Fatalf("Expected buffers, got %v", n)
 	}
-	if expected := 2; expected != len(nb[0]) {
-		t.Fatalf("Expected buffer to be %v bytes long, got %v", expected, len(nb[0]))
+	if len(nb[0]) < 4 {
+		t.Fatalf("Expected buffer to be at least 4 bytes long, got %v", len(nb[0]))
 	}
 	b = nb[0][0]
 	if b&wsFinalBit == 0 {
@@ -821,6 +736,36 @@ func TestWSCloseFrameWithPartialOrInvalid(t *testing.T) {
 	}
 	if b&byte(wsCloseMessage) == 0 {
 		t.Fatalf("Should have been a CLOSE, it wasn't: %v", b)
+	}
+	if status := binary.BigEndian.Uint16(nb[0][2:4]); status != wsCloseStatusProtocolError {
+		t.Fatalf("Expected status to be %v, got %v", wsCloseStatusProtocolError, status)
+	}
+
+	// Now test close with invalid status code.
+	c, ri, tr = testWSSetupForRead()
+	payload = make([]byte, 2)
+	binary.BigEndian.PutUint16(payload, wsCloseStatusNoStatusReceived)
+	closeMsg = testWSCreateClientMsg(wsCloseMessage, 1, true, false, payload)
+	closeFirtByte = []byte{closeMsg[0]}
+	tr.buf = closeMsg[1:]
+	bufs, err = c.wsRead(ri, tr, closeFirtByte[:])
+	if err == nil || !strings.Contains(err.Error(), "invalid close status code") {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n := len(bufs); n != 0 {
+		t.Fatalf("Unexpected buffer returned: %v", n)
+	}
+	c.mu.Lock()
+	nb, _ = c.collapsePtoNB()
+	c.mu.Unlock()
+	if n := len(nb); n == 0 {
+		t.Fatalf("Expected buffers, got %v", n)
+	}
+	if len(nb[0]) < 4 {
+		t.Fatalf("Expected buffer to be at least 4 bytes long, got %v", len(nb[0]))
+	}
+	if status := binary.BigEndian.Uint16(nb[0][2:4]); status != wsCloseStatusProtocolError {
+		t.Fatalf("Expected status to be %v, got %v", wsCloseStatusProtocolError, status)
 	}
 }
 
@@ -918,62 +863,83 @@ func TestWSReadErrors(t *testing.T) {
 		cframe func() []byte
 		err    string
 		nbufs  int
+		setup  func(*client)
+		verify func(*testing.T, *wsReadInfo)
 	}{
 		{
-			func() []byte {
+			cframe: func() []byte {
 				msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("hello"))
 				msg[1] &= ^byte(wsMaskBit)
 				return msg
 			},
-			"mask bit missing", 1,
+			err: "mask bit missing", nbufs: 1,
 		},
 		{
-			func() []byte {
+			cframe: func() []byte {
 				return testWSCreateClientMsg(wsPingMessage, 1, true, false, make([]byte, 200))
 			},
-			"control frame length bigger than maximum allowed", 1,
+			err: "control frame length bigger than maximum allowed", nbufs: 1,
 		},
 		{
-			func() []byte {
+			cframe: func() []byte {
 				return testWSCreateClientMsg(wsPingMessage, 1, false, false, []byte("hello"))
 			},
-			"control frame does not have final bit set", 1,
+			err: "control frame does not have final bit set", nbufs: 1,
 		},
 		{
-			func() []byte {
+			cframe: func() []byte {
 				frag1 := testWSCreateClientMsg(wsBinaryMessage, 1, false, false, []byte("frag1"))
 				newMsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("new message"))
 				all := append([]byte(nil), frag1...)
 				all = append(all, newMsg...)
 				return all
 			},
-			"new message started before final frame for previous message was received", 2,
+			err: "new message started before final frame for previous message was received", nbufs: 2,
 		},
 		{
-			func() []byte {
+			cframe: func() []byte {
 				frame := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("frame"))
 				frag := testWSCreateClientMsg(wsBinaryMessage, 2, false, false, []byte("continuation"))
 				all := append([]byte(nil), frame...)
 				all = append(all, frag...)
 				return all
 			},
-			"invalid continuation frame", 2,
+			err: "invalid continuation frame", nbufs: 2,
 		},
 		{
-			func() []byte {
-				return testWSCreateClientMsg(wsBinaryMessage, 2, false, true, []byte("frame"))
+			cframe: func() []byte {
+				return testWSCreateClientMsg(wsBinaryMessage, 2, false, false, []byte("frame"))
 			},
-			"invalid continuation frame", 1,
+			err: "invalid continuation frame", nbufs: 1,
 		},
 		{
-			func() []byte {
-				return testWSCreateClientMsg(99, 1, false, false, []byte("hello"))
+			cframe: func() []byte {
+				return testWSCreateClientMsg(11, 1, false, false, []byte("hello"))
 			},
-			"unknown opcode", 1,
+			err: "unknown opcode", nbufs: 1,
+		},
+		{
+			cframe: func() []byte {
+				msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, nil)
+				msg = append(msg, 0, 0, 0, 0)
+				msg[1] = 127 | wsMaskBit
+				binary.BigEndian.PutUint64(msg[2:], uint64(1)<<63)
+				return msg
+			},
+			err: "invalid 64-bit payload length", nbufs: 1,
+		},
+		{
+			cframe: func() []byte {
+				return testWSCreateClientMsg(wsBinaryMessage, 1, true, true, []byte("compressed"))
+			},
+			err: "compressed frame received without negotiated permessage-deflate", nbufs: 1,
 		},
 	} {
 		t.Run(test.err, func(t *testing.T) {
 			c, ri, tr := testWSSetupForRead()
+			if test.setup != nil {
+				test.setup(c)
+			}
 			// Add a valid message first
 			msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("hello"))
 			// Then add the bad frame
@@ -991,8 +957,33 @@ func TestWSReadErrors(t *testing.T) {
 			if string(bufs[0]) != "hello" {
 				t.Fatalf("Unexpected content: %s", bufs[0])
 			}
+			if test.verify != nil {
+				test.verify(t, ri)
+			}
 		})
 	}
+}
+
+func TestWSReadHugePayloadLenDoesNotPanic(t *testing.T) {
+	c, ri, tr := testWSSetupForRead()
+	defer require_NoPanic(t)
+
+	rb := make([]byte, 14)
+	rb[0] = byte(wsBinaryMessage) | wsFinalBit
+	rb[1] = 127 | wsMaskBit
+	binary.BigEndian.PutUint64(rb[2:], ^uint64(0))
+	copy(rb[10:], []byte{1, 2, 3, 4})
+
+	_, err := c.wsRead(ri, tr, rb)
+	require_Error(t, err, errors.New("invalid 64-bit payload length"))
+}
+
+func TestWSReadByteWithEmptyCompressedBufferDoesNotPanic(t *testing.T) {
+	r := &wsReadInfo{cbufs: [][]byte{{}}}
+	defer require_NoPanic(t)
+
+	_, err := r.ReadByte()
+	require_Error(t, err, io.EOF) // An empty compressed queue should now behave like EOF because decompression starts only after the final frame is buffered.
 }
 
 func TestWSEnqueueCloseMsg(t *testing.T) {
@@ -1067,6 +1058,26 @@ func (trw *testResponseWriter) WriteHeader(status int) {
 }
 
 func (trw *testResponseWriter) Header() http.Header {
+	if trw.headers == nil {
+		trw.headers = make(http.Header)
+	}
+	return trw.headers
+}
+
+type testNoHijackResponseWriter struct {
+	buf     bytes.Buffer
+	headers http.Header
+}
+
+func (trw *testNoHijackResponseWriter) Write(p []byte) (int, error) {
+	return trw.buf.Write(p)
+}
+
+func (trw *testNoHijackResponseWriter) WriteHeader(status int) {
+	trw.buf.WriteString(fmt.Sprintf("%v", status))
+}
+
+func (trw *testNoHijackResponseWriter) Header() http.Header {
 	if trw.headers == nil {
 		trw.headers = make(http.Header)
 	}
@@ -1149,6 +1160,7 @@ func TestWSCheckOrigin(t *testing.T) {
 	sameOrigin := true
 	allowedListEmpty := []string{}
 	someList := []string{"http://host1.com", "http://host2.com:1234"}
+	sameHostMultiScheme := []string{"http://host3.com", "https://host3.com"}
 
 	for _, test := range []struct {
 		name       string
@@ -1163,6 +1175,7 @@ func TestWSCheckOrigin(t *testing.T) {
 		{"same origin ok", sameOrigin, allowedListEmpty, "host.com", false, "http://host.com:80", ""},
 		{"same origin bad host", sameOrigin, allowedListEmpty, "host.com", false, "http://other.host.com", "not same origin"},
 		{"same origin bad port", sameOrigin, allowedListEmpty, "host.com", false, "http://host.com:81", "not same origin"},
+		{"same origin bad scheme explicit port", sameOrigin, allowedListEmpty, "host.com:443", true, "http://host.com:443", "not same origin"},
 		{"same origin bad scheme", sameOrigin, allowedListEmpty, "host.com", true, "http://host.com", "not same origin"},
 		{"same origin bad uri", sameOrigin, allowedListEmpty, "host.com", false, "@@@://invalid:url:1234", "invalid URI"},
 		{"same origin bad url", sameOrigin, allowedListEmpty, "host.com", false, "http://invalid:url:1234", "too many colons"},
@@ -1172,6 +1185,8 @@ func TestWSCheckOrigin(t *testing.T) {
 		{"no origin same origin and list ignored", sameOrigin, someList, "", false, "", ""},
 		{"allowed from list", notSameOrigin, someList, "", false, "http://host2.com:1234", ""},
 		{"allowed with different path", notSameOrigin, someList, "", false, "http://host1.com/some/path", ""},
+		{"allowed from list same host http", notSameOrigin, sameHostMultiScheme, "", false, "http://host3.com", ""},
+		{"allowed from list same host https", notSameOrigin, sameHostMultiScheme, "", false, "https://host3.com", ""},
 		{"list bad port", notSameOrigin, someList, "", false, "http://host1.com:1234", "not in the allowed list"},
 		{"list bad scheme", notSameOrigin, someList, "", false, "https://host2.com:1234", "not in the allowed list"},
 	} {
@@ -1271,6 +1286,28 @@ func TestWSUpgradeValidationErrors(t *testing.T) {
 				return opts, nil, req
 			},
 			"key missing",
+			http.StatusBadRequest,
+		},
+		{
+			"invalid key encoding",
+			func() (*Options, *testResponseWriter, *http.Request) {
+				opts := testWSOptions()
+				req := testWSCreateValidReq()
+				req.Header.Set("Sec-Websocket-Key", "%%%")
+				return opts, nil, req
+			},
+			"invalid websocket key",
+			http.StatusBadRequest,
+		},
+		{
+			"invalid key length",
+			func() (*Options, *testResponseWriter, *http.Request) {
+				opts := testWSOptions()
+				req := testWSCreateValidReq()
+				req.Header.Set("Sec-Websocket-Key", base64.StdEncoding.EncodeToString([]byte("short")))
+				return opts, nil, req
+			},
+			"invalid websocket key",
 			http.StatusBadRequest,
 		},
 		{
@@ -1383,6 +1420,24 @@ func TestWSUpgradeResponseWriteError(t *testing.T) {
 	}
 }
 
+func TestWSUpgradeNoHijacker(t *testing.T) {
+	opts := testWSOptions()
+	s := &Server{opts: opts}
+	rw := &testNoHijackResponseWriter{}
+	req := testWSCreateValidReq()
+	res, err := s.wsUpgrade(rw, req)
+	if err == nil || !strings.Contains(err.Error(), "websocket upgrade not supported") {
+		t.Fatalf("Should get error %q, got %v", "websocket upgrade not supported", err)
+	}
+	if res != nil {
+		t.Fatalf("Should not have returned a result, got %v", res)
+	}
+	expected := fmt.Sprintf("%v%s\n", http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
+	if got := rw.buf.String(); got != expected {
+		t.Fatalf("Expected %q got %q", expected, got)
+	}
+}
+
 func TestWSUpgradeConnDeadline(t *testing.T) {
 	opts := testWSOptions()
 	opts.Websocket.HandshakeTimeout = time.Second
@@ -1399,6 +1454,21 @@ func TestWSUpgradeConnDeadline(t *testing.T) {
 	if !rw.conn.deadlineCleared {
 		t.Fatal("Connection deadline should have been cleared after handshake")
 	}
+}
+
+func TestWSUpgradeWithEmptyXForwardedForSliceDoesNotPanic(t *testing.T) {
+	opts := testWSOptions()
+	s := &Server{opts: opts}
+	rw := &testResponseWriter{}
+	req := testWSCreateValidReq()
+	req.Header[wsXForwardedForHeader] = []string{}
+	defer require_NoPanic(t)
+
+	res, err := s.wsUpgrade(rw, req)
+	require_NoError(t, err)
+	require_NotNil(t, res)
+	require_NotNil(t, res.ws)
+	require_Equal(t, res.ws.clientIP, _EMPTY_)
 }
 
 func TestWSCompressNegotiation(t *testing.T) {
@@ -1727,6 +1797,16 @@ func TestWSValidateOptions(t *testing.T) {
 			o.Websocket.AllowedOrigins = []string{"http://this:is:bad:url"}
 			return o
 		}, "unable to parse"},
+		{"allowed origin must be absolute URL", func() *Options {
+			o := wso.Clone()
+			o.Websocket.AllowedOrigins = []string{"foo"}
+			return o
+		}, "unable to parse"},
+		{"allowed origin scheme must be http or https", func() *Options {
+			o := wso.Clone()
+			o.Websocket.AllowedOrigins = []string{"ftp://host.com"}
+			return o
+		}, "must be absolute URLs with http or https scheme"},
 		{"missing trusted configuration", func() *Options {
 			o := wso.Clone()
 			o.Websocket.JWTCookie = "jwt"
@@ -1775,9 +1855,22 @@ func TestWSValidateOptions(t *testing.T) {
 			o.Websocket.Headers = map[string]string{"Nats-No-Masking": "false"}
 			return o
 		}, `websocket: invalid header "Nats-No-Masking" not allowed`},
+		{"disabled websocket listener", func() *Options {
+			o := wso.Clone()
+			o.Websocket.Port = 0
+			return o
+		}, ""},
+		{"fips websocket listener", func() *Options {
+			return wso.Clone()
+		}, func() string {
+			if wsAllowedFIPS() {
+				return ""
+			}
+			return "websocket: cannot be used in FIPS-140 mode when built with this Go version, use Go 1.26 or later"
+		}()},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateWebsocketOptions(test.getOpts())
+			err := validateOptions(test.getOpts())
 			if test.err == "" && err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			} else if test.err != "" && (err == nil || !strings.Contains(err.Error(), test.err)) {
@@ -2218,6 +2311,188 @@ func TestWSPubSub(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWSBatchedPubInSingleFrame(t *testing.T) {
+	o := testWSOptions()
+	o.MaxPayload = 16
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	sub := natsSubSync(t, nc, "foo")
+	checkExpectedSubs(t, 1, s)
+
+	wsc, br := testWSCreateClient(t, false, false, o.Websocket.Host, o.Websocket.Port)
+	defer wsc.Close()
+
+	framePayload := []byte("PUB foo 8\r\n12345678\r\nPUB foo 8\r\nabcdefgh\r\nPING\r\n")
+	require_True(t, len(framePayload) > int(o.MaxPayload)) // The WS frame should be larger than a single allowed PUB payload.
+	_, err := wsc.Write(testWSCreateClientMsg(wsBinaryMessage, 1, true, false, framePayload))
+	require_NoError(t, err) // Batched valid PUB commands should be accepted in a single uncompressed WS frame.
+
+	msg := natsNexMsg(t, sub, time.Second)
+	require_Equal(t, string(msg.Data), "12345678") // The first PUB payload should be delivered.
+	msg = natsNexMsg(t, sub, time.Second)
+	require_Equal(t, string(msg.Data), "abcdefgh")               // The second PUB payload should be delivered.
+	require_Equal(t, string(testWSReadFrame(t, br)), "PONG\r\n") // The connection should remain alive and answer the trailing PING.
+}
+
+func TestWSCompressedPubInSingleFrame(t *testing.T) {
+	o := testWSOptions()
+	o.MaxPayload = 64
+	o.Websocket.Compression = true
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	sub := natsSubSync(t, nc, "foo")
+	checkExpectedSubs(t, 1, s)
+
+	wsc, br := testWSCreateClient(t, true, false, o.Websocket.Host, o.Websocket.Port)
+	defer wsc.Close()
+
+	framePayload := []byte("PUB foo 1\r\na\r\n")
+	require_True(t, len(framePayload) <= int(o.MaxPayload)) // The decompressed compressed WS message should stay within max_payload.
+
+	_, err := wsc.Write(testWSCreateClientMsg(wsBinaryMessage, 1, true, true, framePayload))
+	require_NoError(t, err) // A compressed WS message within max_payload should be accepted.
+
+	msg := natsNexMsg(t, sub, time.Second)
+	require_Equal(t, string(msg.Data), "a") // The compressed PUB payload should be delivered.
+	_, err = wsc.Write(testWSCreateClientMsg(wsBinaryMessage, 1, true, true, []byte("PING\r\n")))
+	require_NoError(t, err)                                      // A follow-up compressed PING should still be accepted on the same connection.
+	require_Equal(t, string(testWSReadFrame(t, br)), "PONG\r\n") // The connection should remain alive after the compressed frame.
+}
+
+func TestWSCompressedSequentialFramesRemainResponsive(t *testing.T) {
+	o := testWSOptions()
+	o.Websocket.Compression = true
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	sub := natsSubSync(t, nc, "foo")
+	checkExpectedSubs(t, 1, s)
+
+	wsc, br := testWSCreateClient(t, true, false, o.Websocket.Host, o.Websocket.Port)
+	defer wsc.Close()
+
+	for range 64 {
+		_, err := wsc.Write(testWSCreateClientMsg(wsBinaryMessage, 1, true, true, []byte("PUB foo 1\r\na\r\n")))
+		require_NoError(t, err) // Each compressed websocket message should be accepted on the same connection.
+	}
+
+	for range 64 {
+		msg := natsNexMsg(t, sub, time.Second)
+		require_Equal(t, string(msg.Data), "a") // Each compressed PUB should still be delivered after many compressed frames.
+	}
+
+	_, err := wsc.Write(testWSCreateClientMsg(wsBinaryMessage, 1, true, true, []byte("PING\r\n")))
+	require_NoError(t, err)                                      // The connection should still accept another compressed websocket message after the burst.
+	require_Equal(t, string(testWSReadFrame(t, br)), "PONG\r\n") // The server should still answer PING after many compressed messages on one connection.
+}
+
+func TestWSCompressedFragmentedFrame(t *testing.T) {
+	o := testWSOptions()
+	o.Websocket.Compression = true
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	sub := natsSubSync(t, nc, "foo")
+	checkExpectedSubs(t, 1, s)
+
+	wsc, br := testWSCreateClient(t, true, false, o.Websocket.Host, o.Websocket.Port)
+	defer wsc.Close()
+
+	payload := []byte("PUB foo 1\r\na\r\n")
+	buf := &bytes.Buffer{}
+
+	compressor, err := flate.NewWriter(buf, 1)
+	require_NoError(t, err) // The test should be able to build a fragmented compressed websocket payload.
+
+	_, err = compressor.Write(payload)
+	require_NoError(t, err)                // The compressed websocket payload should be generated successfully.
+	require_NoError(t, compressor.Flush()) // The compressed websocket payload should be finalized successfully.
+
+	compressed := buf.Bytes()
+	compressed = compressed[:len(compressed)-4]
+
+	split := len(compressed) / 2
+	if split == 0 {
+		split = 1
+	}
+	frag1 := testWSCreateClientMsg(wsBinaryMessage, 1, false, false, compressed[:split])
+	frag1[0] |= wsRsv1Bit
+	frag2 := testWSCreateClientMsg(wsBinaryMessage, 2, true, false, compressed[split:])
+
+	_, err = wsc.Write(frag1)
+	require_NoError(t, err) // The first compressed websocket fragment should be accepted.
+
+	_, err = wsc.Write(frag2)
+	require_NoError(t, err) // The final compressed websocket fragment should be accepted.
+
+	msg := natsNexMsg(t, sub, time.Second)
+	require_Equal(t, string(msg.Data), "a") // The fragmented compressed websocket message should be reassembled and delivered.
+
+	_, err = wsc.Write(testWSCreateClientMsg(wsBinaryMessage, 1, true, true, []byte("PING\r\n")))
+	require_NoError(t, err)                                      // The websocket connection should remain usable after fragmented compressed delivery.
+	require_Equal(t, string(testWSReadFrame(t, br)), "PONG\r\n") // The server should still answer PING after the fragmented compressed message.
+}
+
+func TestWSCorruptedCompressedFrameIsRejected(t *testing.T) {
+	o := testWSOptions()
+	o.Websocket.Compression = true
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	logger := &captureErrorLogger{errCh: make(chan string, 10)}
+	s.SetLogger(logger, false, false)
+
+	wsc, _ := testWSCreateClient(t, true, false, o.Websocket.Host, o.Websocket.Port)
+	defer wsc.Close()
+
+	frame := testWSCreateClientMsg(wsBinaryMessage, 1, true, true, []byte("PING\r\n"))
+	frame[len(frame)-1] ^= 0xFF
+	_, err := wsc.Write(frame)
+	require_NoError(t, err) // The corrupted compressed websocket frame should still be writable to the socket.
+
+	select {
+	case msg := <-logger.errCh:
+		require_Contains(t, msg, "corrupt") // The server log should report the inflate corruption.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Expected corrupted compressed websocket frame to be logged")
+	}
+}
+
+func TestWSFlushesBufferedDeliveryBeforeProtocolClose(t *testing.T) {
+	o := testWSOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	sub := natsSubSync(t, nc, "foo")
+	checkExpectedSubs(t, 1, s)
+
+	wsc, _ := testWSCreateClient(t, false, false, o.Websocket.Host, o.Websocket.Port)
+	defer wsc.Close()
+
+	good := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("PUB foo 1\r\na\r\n"))
+	bad := testWSCreateClientMsg(wsPingMessage, 1, true, false, nil)
+	bad[1] &= ^byte(wsMaskBit)
+	buf := append(append([]byte(nil), good...), bad...)
+
+	_, err := wsc.Write(buf)
+	require_NoError(t, err) // The client should be able to send the valid PUB and malformed frame in one write.
+
+	msg := natsNexMsg(t, sub, time.Second)
+	require_Equal(t, string(msg.Data), "a") // The already-buffered delivery should be flushed even though the websocket client is then closed for protocol violation.
 }
 
 func TestWSTLSConnection(t *testing.T) {
@@ -3261,6 +3536,59 @@ func TestWSCompressionFrameSizeLimit(t *testing.T) {
 				t.Fatalf("Unexpected uncomressed data: %q", uncompressed)
 			}
 		})
+	}
+}
+
+func TestWSCompressionPoolBufferRecycling(t *testing.T) {
+	opts := testWSOptions()
+	opts.MaxPending = MAX_PENDING_SIZE
+	s := &Server{opts: opts}
+	c := &client{srv: s, ws: &websocket{compress: true}}
+	c.initClient()
+
+	// Use a payload larger than wsCompressThreshold (64 bytes)
+	// to trigger the compression path.
+	payload := make([]byte, 256)
+	for i := range payload {
+		// Semi-random to be compressible.
+		payload[i] = byte(i % 251)
+	}
+
+	// Warm up: populate the pool and initialize the compressor.
+	nbSlice := make(net.Buffers, 1)
+	for i := 0; i < 10; i++ {
+		c.mu.Lock()
+		data := nbPoolGet(len(payload))
+		data = append(data, payload...)
+		nbSlice[0] = data
+		c.out.nb = nbSlice
+		c.out.pb = int64(len(payload))
+		c.ws.fs = 0
+		bufs, _ := c.collapsePtoNB()
+		for _, buf := range bufs {
+			nbPoolPut(buf)
+		}
+		c.out.nb = nil
+		c.mu.Unlock()
+	}
+
+	allocs := testing.AllocsPerRun(500, func() {
+		c.mu.Lock()
+		data := nbPoolGet(len(payload))
+		data = append(data, payload...)
+		nbSlice[0] = data
+		c.out.nb = nbSlice
+		c.out.pb = int64(len(payload))
+		c.ws.fs = 0
+		bufs, _ := c.collapsePtoNB()
+		for _, buf := range bufs {
+			nbPoolPut(buf)
+		}
+		c.out.nb = nil
+		c.mu.Unlock()
+	})
+	if allocs > 2 {
+		t.Fatalf("Too many allocs per iteration (%.1f); pool buffers are likely being leaked", allocs)
 	}
 }
 
@@ -4477,20 +4805,22 @@ func TestWSDecompressLimit(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		mpayCfg string
+		mpay    int
 	}{
-		{"not explicitly configured", _EMPTY_},
-		{"explicit high", "max_payload: 2097152"},
-		{"explicit low", "max_payload: 4096"},
+		{"not explicitly configured", _EMPTY_, MAX_PAYLOAD_SIZE},
+		{"explicit high", "max_payload: 2097152", 2097152},
+		{"explicit low", "max_payload: 4096", 4096},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			conf := createConfFile(t, fmt.Appendf(nil, `
-				listen: "127.0.0.1:-1"
-				websocket {
 					listen: "127.0.0.1:-1"
-					no_tls: true
-				}
-				%s
-			`, test.mpayCfg))
+					websocket {
+						listen: "127.0.0.1:-1"
+						no_tls: true
+						compression: true
+					}
+					%s
+				`, test.mpayCfg))
 			s, o := RunServerWithConfig(conf)
 			defer s.Shutdown()
 
@@ -4504,16 +4834,23 @@ func TestWSDecompressLimit(t *testing.T) {
 				port:     o.Websocket.Port,
 				noTLS:    true,
 			})
-			// We will hand-craft a frame that would use a 10MB of uncompressed zeros
-			// that should compress really small.
+			// Hand-craft a compressed oversized PUB so the streamed decompressed
+			// bytes are rejected by the regular max_payload parser checks.
 			buf := &bytes.Buffer{}
 			compressor, _ := flate.NewWriter(buf, 1)
-			chunk := make([]byte, 1024*1024)
-			// Compress the equivalent of 100MB of data. We do by chunks to limit
-			// memory usage here.
-			for range 100 {
-				compressor.Write(chunk)
+			size := test.mpay + 1
+			header := []byte(fmt.Sprintf("PUB foo %d\r\n", size))
+			_, _ = compressor.Write(header)
+			chunk := make([]byte, 32*1024)
+			for written := 0; written < size; {
+				n := len(chunk)
+				if rem := size - written; rem < n {
+					n = rem
+				}
+				_, _ = compressor.Write(chunk[:n])
+				written += n
 			}
+			_, _ = compressor.Write([]byte("\r\n"))
 			compressor.Flush()
 			payload := buf.Bytes()
 			// The last 4 bytes are dropped
@@ -4548,10 +4885,8 @@ func TestWSDecompressLimit(t *testing.T) {
 				t.Fatalf("Error sending message: %v", err)
 			}
 
-			// We should have been disconnected.
-			rbuf := make([]byte, 1024)
-			_, err := br.Read(rbuf)
-			require_Error(t, err)
+			msg := testWSReadFrame(t, br)
+			require_Contains(t, string(msg), "Maximum Payload Violation") // The streamed compressed PUB should be rejected by the regular parser limit.
 
 			select {
 			case err := <-l.errCh:
@@ -4563,6 +4898,67 @@ func TestWSDecompressLimit(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWSNoAuthUserOverride(t *testing.T) {
+	o := testWSOptions()
+	// WebSocket has its own no_auth_user override pointing at the lower-
+	// privilege wsguest user. This sets s.websocket.authOverride=true.
+	o.NoAuthUser = "admin"
+	o.Websocket.NoAuthUser = "wsguest"
+
+	adminAcc := NewAccount("admin_acc")
+	wsAcc := NewAccount("ws_acc")
+	o.Accounts = []*Account{adminAcc, wsAcc}
+	o.Users = []*User{
+		{Username: "admin", Password: "adminpass", Account: adminAcc},
+		{Username: "wsguest", Password: "pwd", Account: wsAcc},
+	}
+
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	// Open a WebSocket connection and read the INFO frame.
+	wsc, br, infoLine := testWSCreateClientGetInfo(
+		t, false, false, o.Websocket.Host, o.Websocket.Port,
+	)
+	defer wsc.Close()
+
+	// INFO line format: "INFO {...}\r\n"
+	var info serverInfo
+	require_False(t, len(infoLine) < 5)
+	require_NoError(t, json.Unmarshal([]byte(infoLine[5:]), &info))
+
+	// Send PING BEFORE CONNECT. This is the attack: the WS client attempts to
+	// skip authentication by sending a non-CONNECT op as its first protocol
+	// bytes. The parser fast-path at parser.go:171 will see first byte 'P',
+	// check authSet (true, because expectConnect is set), and consult
+	// s.getOpts().NoAuthUser, which is "admin".
+	wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("PING\r\n"))
+	_, err := wsc.Write(wsmsg)
+	require_NoError(t, err)
+
+	// Read server response.
+	wsc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	defer wsc.SetReadDeadline(time.Time{})
+	msg := testWSReadFrame(t, br)
+
+	// If we got an -ERR or the connection closed then we didn't handle no_auth_user.
+	require_False(t, bytes.HasPrefix(msg, []byte("-ERR")))
+
+	// VULNERABLE: server accepted PING without CONNECT, meaning the
+	// parser fast-path registered the client as the global NoAuthUser.
+	c := s.getClient(info.CID)
+	require_NotNil(t, c)
+	require_NotNil(t, c.acc)
+
+	c.mu.Lock()
+	uname := c.opts.Username
+	aname := c.acc.GetName()
+	c.mu.Unlock()
+
+	require_Equal(t, aname, "ws_acc")
+	require_Equal(t, uname, "wsguest")
 }
 
 // ==================================================================
@@ -4979,4 +5375,46 @@ func Benchmark_WS_Subx5_CN_32768b(b *testing.B) {
 func Benchmark_WS_Subx5_CY_32768b(b *testing.B) {
 	s := sizedStringForCompression(32768)
 	wsBenchSub(b, 5, true, s)
+}
+
+func TestWSCompressedFragmentsDoNotShareNbPoolBuffer(t *testing.T) {
+	opts := testWSOptions()
+	opts.MaxPending = MAX_PENDING_SIZE
+	s := &Server{opts: opts}
+	c := &client{srv: s, ws: &websocket{compress: true, browser: true, nocompfrag: false, maskwrite: false}}
+	c.initClient()
+
+	// Random data does not compress, so the compressed output stays larger than
+	// the browser frame-size limit and is split into multiple frames.
+	uncompressed := make([]byte, 4*wsFrameSizeForBrowsers)
+	n, err := io.ReadFull(rand.New(rand.NewSource(12345)), uncompressed)
+	require_NoError(t, err)
+	require_Equal(t, n, len(uncompressed))
+
+	c.mu.Lock()
+	c.out.nb = append(net.Buffers(nil), uncompressed)
+	nb, _ := c.collapsePtoNB()
+	c.mu.Unlock()
+
+	// collapsePtoNB returns interleaved [header, payload, header, payload, ...].
+	var payloads [][]byte
+	for i := 1; i < len(nb); i += 2 {
+		payloads = append(payloads, nb[i])
+	}
+	require_LessThan(t, 2, len(payloads))
+
+	// Save a later fragment, then simulate another flow reusing the first
+	// fragment's backing array after it has been returned to nbPool: write a
+	// sentinel across the first fragment's full capacity. If each fragment owns
+	// its own buffer, the later fragment is untouched; if they share one array
+	// (the bug), the later fragment is clobbered.
+	first := payloads[0]
+	later := payloads[1]
+	saved := append([]byte(nil), later...)
+
+	scratch := first[:cap(first)]
+	for i := range scratch {
+		scratch[i] = 0xAA
+	}
+	require_True(t, bytes.Equal(later, saved))
 }

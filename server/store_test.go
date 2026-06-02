@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -446,6 +447,84 @@ func TestStoreMaxMsgsPerUpdateBug(t *testing.T) {
 	)
 }
 
+func TestStoreMaxMsgsPerUpdateToOneRemoveNewest(t *testing.T) {
+	config := func() StreamConfig {
+		return StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, MaxMsgsPer: -1}
+	}
+	testAllStoreAllPermutations(
+		t, false, config(),
+		func(t *testing.T, fs StreamStore) {
+			// Store the first copy of "foo.0".
+			_, _, err := fs.StoreMsg("foo.0", nil, nil, 0)
+			require_NoError(t, err)
+
+			// Store filler subjects with enough data that the filestore rolls over into a
+			// second message block, so both copies of "foo.0" live in different blocks.
+			msg := make([]byte, 1024*1024)
+			fillBlock := func(expectedBlocks int) {
+				for i := 1; i <= 9; i++ {
+					_, _, err := fs.StoreMsg(fmt.Sprintf("foo.%d", i), nil, msg, 0)
+					require_NoError(t, err)
+				}
+				if f, ok := fs.(*fileStore); ok {
+					require_True(t, f.numMsgBlocks() >= expectedBlocks)
+				}
+			}
+			fillBlock(2)
+
+			// Store a second copy of "foo.0".
+			nseq, _, err := fs.StoreMsg("foo.0", nil, nil, 0)
+			require_NoError(t, err)
+
+			// And a third, in its own block, which we'll remove as well.
+			fillBlock(3)
+			lseq, _, err := fs.StoreMsg("foo.0", nil, nil, 0)
+			require_NoError(t, err)
+			removed, err := fs.RemoveMsg(lseq)
+			require_NoError(t, err)
+			require_True(t, removed)
+
+			// Update max messages per-subject from -1 (unlimited) to 1.
+			// This transition does not run per-subject limit enforcement, so both copies remain.
+			cfg := config()
+			if _, ok := fs.(*fileStore); ok {
+				cfg.Storage = FileStorage
+			} else {
+				cfg.Storage = MemoryStorage
+			}
+			cfg.MaxMsgsPer = 1
+			require_NoError(t, fs.UpdateConfig(&cfg))
+
+			ss := fs.SubjectsState("foo.0")["foo.0"]
+			require_Equal(t, ss.Msgs, 1)
+			require_Equal(t, ss.First, nseq)
+			require_Equal(t, ss.Last, nseq)
+
+			var smv StoreMsg
+			sm, err := fs.LoadLastMsg("foo.0", &smv)
+			require_NoError(t, err)
+			require_Equal(t, sm.seq, nseq)
+
+			sm, _, err = fs.LoadNextMsg("foo.0", false, 0, &smv)
+			require_NoError(t, err)
+			require_Equal(t, sm.seq, nseq)
+
+			// The older copy must also still be found after a restart.
+			if f, ok := fs.(*fileStore); ok {
+				fcfg := f.fcfg
+				require_NoError(t, f.Stop())
+				f, err = newFileStore(fcfg, cfg)
+				require_NoError(t, err)
+				defer f.Stop()
+
+				sm, err = f.LoadLastMsg("foo.0", &smv)
+				require_NoError(t, err)
+				require_Equal(t, sm.seq, nseq)
+			}
+		},
+	)
+}
+
 func TestStoreCompactCleansUpDmap(t *testing.T) {
 	config := func() StreamConfig {
 		return StreamConfig{Name: "TEST", Subjects: []string{"foo"}, MaxMsgsPer: 0}
@@ -567,6 +646,68 @@ func TestStorePurgeExZero(t *testing.T) {
 			ss = fs.State()
 			require_Equal(t, ss.FirstSeq, 1)
 			require_Equal(t, ss.LastSeq, 0)
+		},
+	)
+}
+
+func TestStorePurgeExSequenceOne(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, true,
+		StreamConfig{Name: "TEST", Subjects: []string{"foo", "bar"}},
+		func(t *testing.T, fs StreamStore) {
+			for range 5 {
+				_, _, err := fs.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+				_, _, err = fs.StoreMsg("bar", nil, nil, 0)
+				require_NoError(t, err)
+			}
+			before := fs.State()
+			check := func(t *testing.T, subject string, keep uint64) {
+				n, err := fs.PurgeEx(subject, 1, keep)
+				require_NoError(t, err)
+				require_Equal(t, n, 0)
+				after := fs.State()
+				require_Equal(t, after.Msgs, before.Msgs)
+				require_Equal(t, after.FirstSeq, before.FirstSeq)
+				require_Equal(t, after.LastSeq, before.LastSeq)
+			}
+			t.Run("empty-subject", func(t *testing.T) { check(t, _EMPTY_, 0) })
+			t.Run("wildcard-subject", func(t *testing.T) { check(t, fwcs, 0) })
+			t.Run("specific-subject", func(t *testing.T) { check(t, "foo", 0) })
+			t.Run("empty-subject-with-keep", func(t *testing.T) { check(t, _EMPTY_, 3) })
+			t.Run("specific-subject-with-keep", func(t *testing.T) { check(t, "foo", 3) })
+		},
+	)
+}
+
+func TestStorePurgeExKeepWithInteriorDeletes(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "TEST", Subjects: []string{"foo"}},
+		func(t *testing.T, fs StreamStore) {
+			for range 50 {
+				_, _, err := fs.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+			}
+			// Remove every other message to create interior gaps.
+			for seq := uint64(2); seq <= 50; seq += 2 {
+				_, err := fs.RemoveMsg(seq)
+				require_NoError(t, err)
+			}
+			ss := fs.State()
+			require_Equal(t, ss.Msgs, 25)
+			require_Equal(t, ss.FirstSeq, 1)
+			require_Equal(t, ss.LastSeq, 50)
+
+			// Keep the 5 newest. Newest 5 existing seqs are 41, 43, 45, 47, 49.
+			n, err := fs.PurgeEx(_EMPTY_, 0, 5)
+			require_NoError(t, err)
+			require_Equal(t, n, 20)
+
+			ss = fs.State()
+			require_Equal(t, ss.Msgs, 5)
+			require_Equal(t, ss.FirstSeq, 41)
+			require_Equal(t, ss.LastSeq, 50)
 		},
 	)
 }
@@ -781,6 +922,82 @@ func TestStoreMsgLoadPrevMsgMulti(t *testing.T) {
 			_, _, err := fs.LoadPrevMsgMulti(sl, 4, &sm)
 			require_Error(t, err, ErrStoreEOF)
 			require_Equal(t, count, 3)
+		},
+	)
+}
+
+func TestStoreMsgLoadPrevMsg(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"foo.*", "bar.*"}},
+		func(t *testing.T, fs StreamStore) {
+			for _, subj := range []string{"foo.1", "bar.1", "foo.2", "bar.2", "foo.3"} {
+				_, _, err := fs.StoreMsg(subj, nil, []byte("ZZZ"), 0)
+				require_NoError(t, err)
+			}
+
+			var sm StoreMsg
+
+			smp, seq, err := fs.LoadPrevMsg(_EMPTY_, false, 5, &sm)
+			require_NoError(t, err)
+			require_Equal(t, smp.subj, "foo.3")
+			require_Equal(t, seq, uint64(5))
+
+			smp, seq, err = fs.LoadPrevMsg("foo.2", false, 5, &sm)
+			require_NoError(t, err)
+			require_Equal(t, smp.subj, "foo.2")
+			require_Equal(t, seq, uint64(3))
+
+			smp, seq, err = fs.LoadPrevMsg("foo.*", true, 5, &sm)
+			require_NoError(t, err)
+			require_Equal(t, smp.subj, "foo.3")
+			require_Equal(t, seq, uint64(5))
+
+			_, seq, err = fs.LoadPrevMsg("baz.*", true, 5, &sm)
+			require_Error(t, err, ErrStoreEOF)
+			require_Equal(t, seq, uint64(1))
+		},
+	)
+}
+
+func TestStoreMsgLoadPrevMsgMultiFullWildcardSkip(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}},
+		func(t *testing.T, fs StreamStore) {
+			for i := range 10 {
+				subj := fmt.Sprintf("foo.%d", i+1)
+				_, _, err := fs.StoreMsg(subj, nil, []byte("ZZZ"), 0)
+				require_NoError(t, err)
+			}
+
+			var sm StoreMsg
+			var state StreamState
+			fs.FastState(&state)
+
+			sl := gsl.NewSimpleSublist()
+			require_NoError(t, sl.Insert(">", struct{}{}))
+
+			var got []uint64
+			for seq := state.LastSeq; ; {
+				smp, nseq, err := fs.LoadPrevMsgMulti(sl, seq, &sm)
+				if err == ErrStoreEOF {
+					require_Equal(t, nseq, state.FirstSeq)
+					break
+				}
+				require_NoError(t, err)
+				require_Equal(t, smp.seq, nseq)
+				got = append(got, nseq)
+				if nseq == state.FirstSeq {
+					_, nseq, err = fs.LoadPrevMsgMulti(sl, nseq-1, &sm)
+					require_Error(t, err, ErrStoreEOF)
+					require_Equal(t, nseq, state.FirstSeq)
+					break
+				}
+				seq = nseq - 1
+			}
+
+			require_True(t, slices.Equal(got, []uint64{10, 9, 8, 7, 6, 5, 4, 3, 2, 1}))
 		},
 	)
 }

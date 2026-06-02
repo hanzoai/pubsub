@@ -222,6 +222,42 @@ func TestDNSAltNameMatching(t *testing.T) {
 	}
 }
 
+func TestProcessUserPermissionsTemplateMalformedOpDoesNotPanic(t *testing.T) {
+	defer require_NoPanic(t)
+
+	lim := jwt.UserPermissionLimits{}
+	lim.Permissions.Sub.Deny = jwt.StringList{"foo.{{x}}"}
+
+	_, err := processUserPermissionsTemplate(lim, &jwt.UserClaims{}, &Account{})
+	require_Error(t, err)
+}
+
+func TestProcessUserPermissionsTemplateUnknownAllowOpDoesNotPanic(t *testing.T) {
+	defer require_NoPanic(t)
+
+	lim := jwt.UserPermissionLimits{}
+	lim.Permissions.Pub.Allow = jwt.StringList{"foo.{{unknown()}}"}
+
+	_, err := processUserPermissionsTemplate(lim, &jwt.UserClaims{}, &Account{})
+	require_Error(t, err)
+}
+
+func TestProcessUserPermissionsTemplateRejectsExcessiveTagExpansions(t *testing.T) {
+	defer require_NoPanic(t)
+
+	lim := jwt.UserPermissionLimits{}
+	lim.Permissions.Pub.Allow = jwt.StringList{"foo.{{tag(a)}}.{{tag(b)}}"}
+
+	uc := &jwt.UserClaims{}
+	for i := range 128 {
+		uc.Tags = append(uc.Tags, fmt.Sprintf("a:v%d", i))
+		uc.Tags = append(uc.Tags, fmt.Sprintf("b:v%d", i))
+	}
+
+	_, err := processUserPermissionsTemplate(lim, uc, &Account{})
+	require_Error(t, err)
+}
+
 func TestNoAuthUser(t *testing.T) {
 	conf := createConfFile(t, []byte(`
 		listen: "127.0.0.1:-1"
@@ -697,7 +733,8 @@ func TestAuthProxyRequired(t *testing.T) {
 	ujwt, err := nuc.Encode(akp)
 	require_NoError(t, err)
 
-	lopts := &DefaultTestOptions
+	dto := DefaultTestOptions
+	lopts := &dto
 	u, err := url.Parse(fmt.Sprintf("nats://%s:%d", o.LeafNode.Host, o.LeafNode.Port))
 	require_NoError(t, err)
 	remote := &RemoteLeafOpts{URLs: []*url.URL{u}}
