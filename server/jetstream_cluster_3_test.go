@@ -1766,6 +1766,130 @@ func TestJetStreamClusterGhostEphemeralsAfterRestart(t *testing.T) {
 	})
 }
 
+func TestJetStreamClusterConsumerAssignmentSameIdentity(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "CONSUMER",
+		Replicas:  1,
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	// Snapshot the original assignment from the meta leader.
+	captureCa := func() *consumerAssignment {
+		ml := c.leader()
+		require_NotNil(t, ml)
+		mjs := ml.getJetStream()
+		require_NotNil(t, mjs)
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		ca := mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+		require_NotNil(t, ca)
+		// Clone so it survives subsequent delete/recreate of the live entry.
+		return ca.clone()
+	}
+	oldCa := captureCa()
+
+	// A config update keeps the same Name/Stream/Group/Created, so an inflight
+	// deleteNotActive holding the prior ca must still consider this the same
+	// logical consumer.
+	_, err = js.UpdateConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "CONSUMER",
+		Replicas:          1,
+		AckPolicy:         nats.AckExplicitPolicy,
+		InactiveThreshold: time.Hour,
+	})
+	require_NoError(t, err)
+
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		updatedCa := captureCa()
+		if updatedCa.Config.InactiveThreshold != time.Hour {
+			return fmt.Errorf("update not yet reflected, got %v", updatedCa.Config.InactiveThreshold)
+		}
+		if !oldCa.sameIdentity(updatedCa) {
+			return fmt.Errorf("expected same identity across update")
+		}
+		return nil
+	})
+
+	// Delete and recreate. The new consumer must have a distinct identity so a
+	// stale deleteNotActive holding oldCa would correctly skip the proposal.
+	require_NoError(t, js.DeleteConsumer("TEST", "CONSUMER"))
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "CONSUMER",
+		Replicas:  1,
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		newCa := captureCa()
+		if oldCa.sameIdentity(newCa) {
+			return fmt.Errorf("expected different identity across recreate (old.Created=%v new.Created=%v old.Group=%q new.Group=%q)",
+				oldCa.Created, newCa.Created, oldCa.Group.Name, newCa.Group.Name)
+		}
+		return nil
+	})
+}
+
+func TestJetStreamClusterDeleteNotActiveOnFollowerDoesNotDeleteConsumer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Long InactiveThreshold so the normal timer does not fire during the test.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "CONSUMER",
+		AckPolicy:         nats.AckExplicitPolicy,
+		Replicas:          3,
+		InactiveThreshold: time.Hour,
+	})
+	require_NoError(t, err)
+
+	cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, cl)
+	cf := c.randomNonConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, cf)
+	require_NotEqual(t, cl, cf)
+
+	// Get the follower's local consumer object.
+	mset, err := cf.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+	require_False(t, o.isLeader())
+
+	// Simulate a stale cleanup timer firing post-stepdown on a follower.
+	go o.deleteNotActive()
+
+	// Give any erroneous delete proposal time to apply.
+	time.Sleep(2 * time.Second)
+
+	_, err = js.ConsumerInfo("TEST", "CONSUMER")
+	require_NoError(t, err)
+}
+
 func TestJetStreamClusterReplacementPolicyAfterPeerRemove(t *testing.T) {
 	// R3 scenario where there is a redundant node in each unique cloud so removing a peer should result in
 	// an immediate replacement also preserving cloud uniqueness.
@@ -2895,13 +3019,20 @@ func TestJetStreamClusterInterestPolicyEphemeral(t *testing.T) {
 			require_NoError(t, err)
 
 			// This happens only if we start publishing messages after consumer was created.
+			pubErr := make(chan error, 1)
 			pubDone := make(chan struct{})
 			go func(subject string) {
+				defer close(pubDone)
 				for i := 0; i < msgs; i++ {
 					_, err := js.Publish(subject, []byte("DATA"))
-					require_NoError(t, err)
+					if err != nil {
+						select {
+						case pubErr <- err:
+						default:
+						}
+						return
+					}
 				}
-				close(pubDone)
 			}(test.subject)
 
 			// Wait for inactive threshold to expire and all messages to be published and received
@@ -2912,6 +3043,12 @@ func TestJetStreamClusterInterestPolicyEphemeral(t *testing.T) {
 			case <-pubDone:
 			case <-time.After(10 * time.Second):
 				t.Fatalf("Did not receive completion signal")
+			}
+
+			select {
+			case err := <-pubErr:
+				t.Fatalf("Publish error: %v", err)
+			default:
 			}
 
 			checkFor(t, time.Second, 100*time.Millisecond, func() error {
@@ -3458,6 +3595,93 @@ func TestJetStreamClusterInterestLeakOnDisableJetStream(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestJetStreamClusterDisableVsShutdownJetStreamMetaState(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.leader())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	c.waitOnAllCurrent()
+
+	var followers []*Server
+	for _, s := range c.servers {
+		if s.Running() && !s.JetStreamIsLeader() {
+			followers = append(followers, s)
+		}
+	}
+	require_True(t, len(followers) >= 2)
+	sShutdown, sDisable := followers[0], followers[1]
+
+	// ShutdownJetStream preserves meta-raft state on disk.
+	shutdownDir := filepath.Join(sShutdown.JetStreamConfig().StoreDir, DEFAULT_SYSTEM_ACCOUNT, defaultStoreDirName, defaultMetaGroupName)
+	tavFile := filepath.Join(shutdownDir, termVoteFile)
+	peersFile := filepath.Join(shutdownDir, peerStateFile)
+	for _, f := range []string{shutdownDir, tavFile, peersFile} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("expected %s to exist before Shutdown: %v", f, err)
+		}
+	}
+	require_NoError(t, sShutdown.ShutdownJetStream())
+	for _, f := range []string{shutdownDir, tavFile, peersFile} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("expected %s to be preserved after Shutdown: %v", f, err)
+		}
+	}
+
+	// DisableJetStream wipes meta-raft state on disk.
+	disableDir := filepath.Join(sDisable.JetStreamConfig().StoreDir, DEFAULT_SYSTEM_ACCOUNT, defaultStoreDirName, defaultMetaGroupName)
+	if _, err := os.Stat(disableDir); err != nil {
+		t.Fatalf("expected %s to exist before Disable: %v", disableDir, err)
+	}
+	require_NoError(t, sDisable.DisableJetStream())
+	if _, err := os.Stat(disableDir); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be removed after Disable, got err=%v", disableDir, err)
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/8150
+func TestJetStreamClusterHandleWritePermissionErrorPreservesMetaState(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.leader())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	c.waitOnAllCurrent()
+
+	s := c.randomNonLeader()
+	tavFile := filepath.Join(s.JetStreamConfig().StoreDir, DEFAULT_SYSTEM_ACCOUNT, defaultStoreDirName, defaultMetaGroupName, termVoteFile)
+	if _, err := os.Stat(tavFile); err != nil {
+		t.Fatalf("expected %s to exist before the simulated permission error: %v", tavFile, err)
+	}
+
+	s.handleWritePermissionError()
+
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if s.JetStreamEnabled() {
+			return fmt.Errorf("JetStream still enabled")
+		}
+		return nil
+	})
+
+	if _, err := os.Stat(tavFile); err != nil {
+		t.Fatalf("meta state was wiped after a transient permission error: %v", err)
+	}
 }
 
 func TestJetStreamClusterNoLeadersDuringLameDuck(t *testing.T) {
@@ -5462,7 +5686,28 @@ func TestJetStreamClusterConsumerMaxDeliveryNumAckPendingBug(t *testing.T) {
 		require_NoError(t, err)
 	}
 
+	subscribeAdvisoriesCount := func(consumer string) *atomic.Int64 {
+		t.Helper()
+		var count atomic.Int64
+		subj := fmt.Sprintf("%s.%s.%s", JSAdvisoryConsumerMaxDeliveryExceedPre, "TEST", consumer)
+		sub, err := nc.Subscribe(subj, func(*nats.Msg) { count.Add(1) })
+		require_NoError(t, err)
+		t.Cleanup(func() { sub.Unsubscribe() })
+		require_NoError(t, nc.Flush())
+		return &count
+	}
+	requireAdvisoriesCount := func(consumer string, count *atomic.Int64, want int64, when string) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+			if got := count.Load(); got != want {
+				return fmt.Errorf("%s consumer expected %d advisories %s, got %d", consumer, want, when, got)
+			}
+			return nil
+		})
+	}
+
 	// File based.
+	fileAdv := subscribeAdvisoriesCount("file")
 	sub, err := js.PullSubscribe("foo", "file",
 		nats.ManualAck(),
 		nats.MaxDeliver(1),
@@ -5477,6 +5722,7 @@ func TestJetStreamClusterConsumerMaxDeliveryNumAckPendingBug(t *testing.T) {
 
 	// Let first batch expire.
 	time.Sleep(1200 * time.Millisecond)
+	requireAdvisoriesCount("file", fileAdv, 10, "before stepdown")
 
 	cia, err := js.ConsumerInfo("TEST", "file")
 	require_NoError(t, err)
@@ -5509,7 +5755,13 @@ func TestJetStreamClusterConsumerMaxDeliveryNumAckPendingBug(t *testing.T) {
 
 	checkConsumerInfo(cia, cib, true)
 
+	// Give the new leader a settle window. setLeader calls checkPending
+	// synchronously, but the apply goroutine may run a few ms later.
+	time.Sleep(500 * time.Millisecond)
+	requireAdvisoriesCount("file", fileAdv, 10, "after stepdown")
+
 	// Memory based.
+	memAdv := subscribeAdvisoriesCount("mem")
 	sub, err = js.PullSubscribe("foo", "mem",
 		nats.ManualAck(),
 		nats.MaxDeliver(1),
@@ -5525,6 +5777,7 @@ func TestJetStreamClusterConsumerMaxDeliveryNumAckPendingBug(t *testing.T) {
 
 	// Let first batch retry and expire.
 	time.Sleep(1200 * time.Millisecond)
+	requireAdvisoriesCount("mem", memAdv, 10, "before stepdown")
 
 	cia, err = js.ConsumerInfo("TEST", "mem")
 	require_NoError(t, err)
@@ -5538,8 +5791,11 @@ func TestJetStreamClusterConsumerMaxDeliveryNumAckPendingBug(t *testing.T) {
 	require_NoError(t, err)
 
 	checkConsumerInfo(cia, cib, true)
+	requireAdvisoriesCount("mem", memAdv, 10, "after stepdown")
 
 	// Now file based but R1 and server restart.
+	r1Adv := subscribeAdvisoriesCount("r1")
+
 	sub, err = js.PullSubscribe("foo", "r1",
 		nats.ManualAck(),
 		nats.MaxDeliver(1),
@@ -5555,6 +5811,7 @@ func TestJetStreamClusterConsumerMaxDeliveryNumAckPendingBug(t *testing.T) {
 
 	// Let first batch retry and expire.
 	time.Sleep(1200 * time.Millisecond)
+	requireAdvisoriesCount("r1", r1Adv, 10, "before restart")
 
 	cia, err = js.ConsumerInfo("TEST", "r1")
 	require_NoError(t, err)
@@ -5572,6 +5829,12 @@ func TestJetStreamClusterConsumerMaxDeliveryNumAckPendingBug(t *testing.T) {
 	now := time.Now()
 	cia.Created, cib.Created = now, now
 	checkConsumerInfo(cia, cib, false)
+
+	// On startup the R1 consumer's setLeader -> readStoredState -> applyState
+	// reloads pending from disk; if ghosts persisted, setLeader's checkPending
+	// re-fires every advisory exactly as a follower-promoted leader would.
+	time.Sleep(500 * time.Millisecond)
+	requireAdvisoriesCount("r1", r1Adv, 10, "after server restart")
 }
 
 func TestJetStreamClusterConsumerDefaultsFromStream(t *testing.T) {
@@ -6078,7 +6341,7 @@ func TestJetStreamClusterLimitsBasedStreamFileStoreDesync(t *testing.T) {
 	    ]
 	  }
 	  js {
-	    jetstream = { store_max_stream_bytes = 3mb }
+	    jetstream = { max_store = 3mb }
 	    users = [
 	      { user: js, pass: js }
 	    ]
@@ -6444,6 +6707,100 @@ func TestJetStreamClusterAccountFileStoreLimits(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestJetStreamClusterTieredReservationConsistency(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, cjs := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	for _, replicas := range []int{1, 3} {
+		subj := fmt.Sprintf("R%d", replicas)
+		maxBytes := int64(1)
+		if replicas > 1 {
+			maxBytes = 10
+		}
+		_, err := cjs.AddStream(&nats.StreamConfig{
+			Name:      subj,
+			Replicas:  replicas,
+			Storage:   nats.FileStorage,
+			Retention: nats.LimitsPolicy,
+			MaxBytes:  maxBytes,
+		})
+		require_NoError(t, err)
+	}
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, "R3")
+	})
+
+	sl := c.streamLeader(globalAccountName, "R1")
+	_, js, jsa := sl.globalAccount().getJetStreamFromAccount()
+
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+	jsa.mu.RLock()
+	defer jsa.mu.RUnlock()
+
+	cfg := &StreamConfig{Storage: FileStorage}
+
+	// No tier, R1: 1, R3: 10*R
+	tier := _EMPTY_
+	require_Equal(t, jsa.tieredReservation(tier, cfg), 31)
+	streams, reservation := js.tieredStreamAndReservationCount(globalAccountName, tier, cfg)
+	require_Equal(t, streams, 2)
+	require_Equal(t, reservation, 31)
+
+	// R1 tier, R1: 1
+	tier, cfg.Replicas = "R1", 1
+	require_Equal(t, jsa.tieredReservation(tier, cfg), 1)
+	streams, reservation = js.tieredStreamAndReservationCount(globalAccountName, tier, cfg)
+	require_Equal(t, streams, 1)
+	require_Equal(t, reservation, 1)
+
+	// R3 tier, R3: 10
+	tier, cfg.Replicas = "R3", 3
+	require_Equal(t, jsa.tieredReservation(tier, cfg), 10)
+	streams, reservation = js.tieredStreamAndReservationCount(globalAccountName, tier, cfg)
+	require_Equal(t, streams, 1)
+	require_Equal(t, reservation, 10)
+}
+
+func TestJetStreamClusterTieredReservationOverflow(t *testing.T) {
+	tmpl := strings.Replace(jsClusterMaxBytesAccountLimitTempl, "max_file_store: 4GB", "max_file_store: 9223372036854775807", 1)
+	tmpl = strings.Replace(tmpl, "max_file:  3GB", "max_file:  9223372036854775807", 1)
+	c := createJetStreamClusterWithTemplate(t, tmpl, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Create a stream with R=3 and MaxBytes large enough that
+	// Replicas * MaxBytes overflows int64:
+	//   3 * 4e18 = 12e18 > MaxInt64 (9.22e18)
+	// The account limit is MaxInt64, so the first stream is accepted: its
+	// reservation saturates to MaxInt64 rather than wrapping negative.
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "S1",
+		Subjects: []string{"s1"},
+		MaxBytes: 4_000_000_000_000_000_000, // 4e18
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// The true reservation for S1 is 3 * 4e18 = 12e18, which saturates to
+	// MaxInt64 and consumes the whole account. Creating any additional
+	// stream should be rejected. With the overflow bug, the reservation
+	// computation wraps to a negative value, making the account appear
+	// to have plenty of room.
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "S2",
+		Subjects: []string{"s2"},
+		MaxBytes: 1,
+		Replicas: 3,
+	})
+	require_Error(t, err, errors.New("nats: insufficient storage resources available"))
 }
 
 func TestJetStreamClusterCorruptMetaSnapshot(t *testing.T) {
