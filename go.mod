@@ -11,7 +11,7 @@ require (
 	github.com/luxfi/consensus v1.22.0
 	github.com/luxfi/zapdb v1.0.0
 	github.com/nats-io/jwt/v2 v2.8.1
-	github.com/nats-io/nats.go v1.48.0
+	github.com/nats-io/nats.go v1.50.0
 	github.com/nats-io/nkeys v0.4.15
 	github.com/nats-io/nuid v1.0.1
 	github.com/zap-proto/go v0.2.0
