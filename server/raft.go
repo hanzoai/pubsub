@@ -103,17 +103,6 @@ type RaftNodeCheckpoint interface {
 	InstallSnapshot(data []byte) (uint64, error)
 }
 
-// RaftNodeCheckpoint is used as an alternative to a direct InstallSnapshot.
-// A checkpoint is created from CreateSnapshotCheckpoint and allows installing snapshots asynchronously,
-// as well as loading the last snapshot or entries between the last snapshot and the one we're about to create.
-// Abort can be called to cancel the snapshot installation at any time, or InstallSnapshot to install it.
-type RaftNodeCheckpoint interface {
-	LoadLastSnapshot() (snap []byte, err error)
-	AppendEntriesSeq() iter.Seq2[*appendEntry, error]
-	Abort()
-	InstallSnapshot(data []byte) (uint64, error)
-}
-
 type WAL interface {
 	Type() StorageType
 	StoreMsg(subj string, hdr, msg []byte, ttl int64) (uint64, int64, error)
@@ -260,6 +249,9 @@ type raft struct {
 	scaleUp      bool // The node is part of a scale up, puts us in observer mode until the log contains data.
 	deleted      bool // If the node was deleted.
 	snapshotting bool // Snapshot is in progress.
+	quorumPaused bool // Pause replication and quorum participation to prevent log growth during slow applies.
+
+	overrunCount uint64 // Counter of how many times we were overrun, either as follower or as leader.
 }
 
 type proposedEntry struct {
@@ -1557,12 +1549,20 @@ func (c *checkpoint) InstallSnapshot(data []byte) (uint64, error) {
 	n.Unlock()
 	err := writeFileWithSync(c.snapFile, encoded, defaultFilePerms)
 	n.Lock()
+	// On either failure path, drop the file we just wrote so it doesn't get
+	// picked up by setupLastSnapshot on restart. Skip the remove if it's the
+	// snapshot already adopted into n.snapfile for this term/applied.
 	if err != nil {
+		if c.snapFile != n.snapfile {
+			os.Remove(c.snapFile)
+		}
 		// We could set write err here, but if this is a temporary situation, too many open files etc.
 		// we want to retry and snapshots are not fatal.
 		return 0, err
 	} else if !n.snapshotting {
-		// The checkpoint can be aborted at any time, don't continue if that happened.
+		if c.snapFile != n.snapfile {
+			os.Remove(c.snapFile)
+		}
 		return 0, errSnapAborted
 	}
 
@@ -2979,6 +2979,16 @@ func (n *raft) handleForwardedRemovePeerProposal(sub *subscription, c *client, _
 		n.RUnlock()
 		return
 	}
+	if _, ok := n.peers[string(msg)]; !ok {
+		n.debug("Ignoring forwarded peer removal proposal, peer not found")
+		n.RUnlock()
+		return
+	}
+	if len(n.peers) <= 1 {
+		n.debug("Ignoring forwarded peer removal proposal, remove last node")
+		n.RUnlock()
+		return
+	}
 	prop := n.prop
 	n.RUnlock()
 
@@ -3979,6 +3989,19 @@ func (n *raft) truncateWAL(term, index uint64) {
 	// Set after we know we have truncated properly.
 	n.pterm, n.pindex = term, index
 
+	// Invalidate cached entries the WAL no longer has.
+	if index == 0 {
+		if len(n.pae) > 0 {
+			n.pae = make(map[uint64]*appendEntry)
+		}
+	} else {
+		for k := range n.pae {
+			if k > index {
+				delete(n.pae, k)
+			}
+		}
+	}
+
 	// Check if we're truncating an uncommitted membership change.
 	if n.membChangeIndex > 0 && n.membChangeIndex > index {
 		n.membChangeIndex = 0
@@ -4333,9 +4356,6 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 
 			// Inherit state from appendEntry with the leader's snapshot.
 			hadPreviousSnapshot := n.snapfile != _EMPTY_
-			n.pindex = ae.pindex
-			n.pterm = ae.pterm
-			n.commit = ae.pindex
 
 			snap := &snapshot{
 				lastTerm:  ae.pterm,
