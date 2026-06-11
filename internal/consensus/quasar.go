@@ -49,7 +49,7 @@ const (
 	fldOpJSON      = 8  // bytes: JSON-encoded Op
 	fldValidatorID = 16 // text: validator ID
 	fldSigBLS      = 24 // bytes: BLS signature
-	fldSigRingtail = 32 // bytes: Ringtail/ML-DSA signature
+	fldSigCorona = 32 // bytes: Corona/ML-DSA signature
 	fldHeight      = 40 // uint64: finalized height
 	fldSinceHeight = 48 // uint64: sync from height
 
@@ -437,7 +437,7 @@ func (q *Quasar) sendVote(ctx context.Context, peerID string, hash string, sig *
 	obj.SetText(fldHash, hash)
 	obj.SetText(fldValidatorID, q.validatorID)
 	obj.SetBytes(fldSigBLS, sig.BLS)
-	obj.SetBytes(fldSigRingtail, sig.Ringtail)
+	obj.SetBytes(fldSigCorona, sig.Corona)
 	obj.FinishAsRoot()
 
 	msg, err := zap.Parse(b.Finish())
@@ -511,7 +511,7 @@ func (q *Quasar) handleVote(_ context.Context, from string, msg *zap.Message) (*
 	hash := root.Text(fldHash)
 	validatorID := root.Text(fldValidatorID)
 	bls := root.Bytes(fldSigBLS)
-	ringtail := root.Bytes(fldSigRingtail)
+	corona := root.Bytes(fldSigCorona)
 
 	if hash == "" || validatorID == "" {
 		return zapConsensusError("invalid vote")
@@ -533,7 +533,7 @@ func (q *Quasar) handleVote(_ context.Context, from string, msg *zap.Message) (*
 
 	sig := &QuasarSignature{
 		BLS:         bls,
-		Ringtail:    ringtail,
+		Corona:    corona,
 		ValidatorID: validatorID,
 	}
 
