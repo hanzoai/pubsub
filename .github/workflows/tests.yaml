@@ -18,7 +18,7 @@ concurrency:
 jobs:
   signoffs:
     name: Sign-offs
-    runs-on: ubuntu-latest
+    runs-on: hanzo-build-linux-amd64
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
@@ -58,7 +58,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: hanzo-build-linux-amd64
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -81,7 +81,7 @@ jobs:
   build-latest:
     name: Build (Latest Go)
     needs: [lint]
-    runs-on: ubuntu-latest
+    runs-on: hanzo-build-linux-amd64
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -100,7 +100,7 @@ jobs:
   build-supported:
     name: Build (Minimum Go)
     needs: [lint]
-    runs-on: ubuntu-latest
+    runs-on: hanzo-build-linux-amd64
     steps:
       - name: Checkout
         uses: actions/checkout@v6
