@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   nightly_coverage:
-    runs-on: ubuntu-latest
+    runs-on: hanzo-build-linux-amd64
 
     env:
       GOPATH: /home/runner/work/pubsub
