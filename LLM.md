@@ -1,4 +1,4 @@
-# LLM.md - Hanzo PubSub
+# Hanzo PubSub
 
 ## Overview
 NATS server fork with Quasar PQ consensus, ZAP control plane, zapdb persistence,
