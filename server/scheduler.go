@@ -199,11 +199,12 @@ func (ms *MsgScheduling) getScheduledMessages(loadMsg func(seq uint64, smv *Stor
 				ms.remove(seq)
 				return true
 			}
+			rollup := getMessageScheduleRollup(sm.hdr)
 			source := getMessageScheduleSource(sm.hdr)
 			if source != _EMPTY_ {
-				if sm = loadLast(source, &smv); sm == nil {
-					ms.remove(seq)
-					return true
+				// Fall back to the scheduled message's own content if the source has no last message.
+				if srcSm := loadLast(source, &srcSmv); srcSm != nil {
+					sm = srcSm
 				}
 			}
 
