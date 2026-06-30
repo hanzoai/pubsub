@@ -442,6 +442,9 @@ type consumer struct {
 	rlimit            *rate.Limiter
 	reqSub            *subscription
 	resetSub          *subscription
+	ackSubOld         *subscription
+	ackReplyOldT      string
+	ackSubjOld        string
 	ackSub            *subscription
 	ackReplyT         string
 	ackSubj           string
@@ -1111,10 +1114,12 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		return nil, NewJSConsumerDoesNotExistError()
 	}
 
+	standalone := !s.JetStreamIsClustered() && s.standAloneMode()
+
 	// If we're clustered we've already done this check, only do this if we're a standalone server.
 	// But if we're standalone, only enforce if we're not recovering, since the MaxConsumers could've
 	// been updated while we already had more consumers on disk.
-	if !s.JetStreamIsClustered() && s.standAloneMode() && !isRecovering {
+	if standalone && !isRecovering {
 		// Check for any limits, if the config for the consumer sets a limit we check against that
 		// but if not we use the value from account limits, if account limits is more restrictive
 		// than stream config we prefer the account limits to handle cases where account limits are
@@ -1123,7 +1128,7 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		if maxc <= 0 || (selectedLimits.MaxConsumers > 0 && selectedLimits.MaxConsumers < maxc) {
 			maxc = selectedLimits.MaxConsumers
 		}
-		if maxc > 0 && mset.numPublicConsumers() >= maxc {
+		if maxc > 0 && mset.numLimitableConsumers() >= maxc {
 			mset.mu.Unlock()
 			return nil, NewJSMaximumConsumersLimitError()
 		}
@@ -1714,10 +1719,6 @@ func (o *consumer) setLeader(isLeader bool) error {
 			o.mu.Unlock()
 			return nil
 		}
-		if o.resetSub, err = o.subscribeInternal(o.resetSubj, o.processResetReq); err != nil {
-			o.mu.Unlock()
-			return
-		}
 
 		// Check on flow control settings.
 		if o.cfg.FlowControl {
@@ -1846,8 +1847,9 @@ func (o *consumer) setLeader(isLeader bool) error {
 		o.unsubscribe(o.ackSub)
 		o.unsubscribe(o.reqSub)
 		o.unsubscribe(o.resetSub)
+		o.unsubscribe(o.fcSubOld)
 		o.unsubscribe(o.fcSub)
-		o.ackSub, o.reqSub, o.resetSub, o.fcSub = nil, nil, nil, nil
+		o.ackSubOld, o.ackSub, o.reqSub, o.resetSub, o.fcSubOld, o.fcSub = nil, nil, nil, nil, nil, nil
 		if o.infoSub != nil {
 			o.srv.sysUnsubscribe(o.infoSub)
 			o.infoSub = nil
@@ -2627,6 +2629,9 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 	// Allowed but considered no-op, [Description, SampleFrequency, MaxWaiting, HeadersOnly]
 	o.cfg = *cfg
 
+	if cfg.Sourcing && (!o.srv.JetStreamIsClustered() && o.srv.standAloneMode()) {
+		o.resetStartingSeqLocked(0, _EMPTY_, false)
+	}
 	if updatedFilters {
 		// Cleanup messages that lost interest.
 		if o.retention == InterestPolicy {
@@ -2792,10 +2797,14 @@ func (o *consumer) updateSkipped(seq uint64) {
 	o.propose(b[:])
 }
 
-func (o *consumer) resetStartingSeq(seq uint64, reply string) (uint64, bool, error) {
+func (o *consumer) resetStartingSeq(seq uint64, reply string, internal bool) (uint64, bool, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	return o.resetStartingSeqLocked(seq, reply, internal)
+}
 
+// Lock should be held.
+func (o *consumer) resetStartingSeqLocked(seq uint64, reply string, internal bool) (uint64, bool, error) {
 	// Reset to a specific sequence, or back to the ack floor.
 	if seq == 0 {
 		seq = o.asflr + 1
@@ -2824,17 +2833,27 @@ VALID:
 	if seq <= 0 {
 		seq = 1
 	}
-	o.resetLocalStartingSeq(seq)
-	// Clustered mode and R>1.
+	// The replicated path requires quorum first before the reset actually takes effect.
 	if o.node != nil {
+		if !o.isLeader() {
+			return 0, false, nil
+		}
 		b := make([]byte, 1+8+len(reply))
 		b[0] = byte(resetSeqOp)
 		var le = binary.LittleEndian
 		le.PutUint64(b[1:], seq)
 		copy(b[1+8:], reply)
 		o.propose(b[:])
+		if reply != _EMPTY_ {
+			if o.rsm == nil {
+				o.rsm = make(map[string]bool, 1)
+			}
+			o.rsm[reply] = internal
+		}
 		return seq, false, nil
-	} else if o.store != nil {
+	}
+	o.resetLocalStartingSeq(seq)
+	if o.store != nil {
 		o.store.Reset(seq - 1)
 		// Cleanup messages that lost interest.
 		if o.retention == InterestPolicy {
@@ -4498,7 +4517,7 @@ func (o *consumer) processResetReq(_ *subscription, c *client, a *Account, _, re
 			return
 		}
 	}
-	resetSeq, canRespond, err := o.resetStartingSeq(req.Seq, reply)
+	resetSeq, canRespond, err := o.resetStartingSeq(req.Seq, reply, false)
 	if err != nil {
 		resp.Error = NewJSConsumerInvalidResetError(err)
 		s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
@@ -4813,6 +4832,9 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 				// That will correct the pending state and delivery/ack floors, so just skip here.
 				pmsg.returnToPool()
 				pmsg = nil
+				if p, ok := o.pending[seq]; ok {
+					o.processTermLocked(seq, p.Sequence, dc-1, ackTermUnackedLimitsReason, _EMPTY_, false)
+				}
 				continue
 			}
 			return pmsg, dc, err
@@ -6583,11 +6605,13 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 	o.unsubscribe(o.ackSub)
 	o.unsubscribe(o.reqSub)
 	o.unsubscribe(o.resetSub)
+	o.unsubscribe(o.fcSubOld)
 	o.unsubscribe(o.fcSub)
 	o.ackSubOld = nil
 	o.ackSub = nil
 	o.reqSub = nil
 	o.resetSub = nil
+	o.fcSubOld = nil
 	o.fcSub = nil
 	if o.infoSub != nil {
 		o.srv.sysUnsubscribe(o.infoSub)

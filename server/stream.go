@@ -806,11 +806,22 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 		jsa.mu.Unlock()
 		return nil, NewJSNoLimitsError()
 	}
-	js.mu.RLock()
-	if isClustered {
-		_, reserved = js.tieredStreamAndReservationCount(a.Name, tier, cfg)
-	}
-	if err := js.checkAllLimits(&selected, cfg, reserved, 0); err != nil {
+
+	// Skip if we're recovering.
+	if !recovering {
+		reserved := int64(0)
+		if !isClustered {
+			reserved = jsa.tieredReservation(tier, cfg)
+		}
+		jsa.mu.Unlock()
+		js.mu.RLock()
+		if isClustered {
+			_, reserved = js.tieredStreamAndReservationCount(a.Name, tier, cfg)
+		}
+		if err := js.checkAllLimits(&selected, tier, cfg, reserved, 0); err != nil {
+			js.mu.RUnlock()
+			return nil, err
+		}
 		js.mu.RUnlock()
 		jsa.mu.Lock()
 	}
