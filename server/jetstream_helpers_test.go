@@ -691,6 +691,7 @@ var jsClusterImportsTempl = `
 				{ service: "$JS.API.>", response: stream }
 				{ service: "TEST" } # For publishing to the stream.
 				{ service: "$JS.ACK.TEST.*.>" }
+				{ service: "$JS.ACK.*.*.TEST.*.>" }
 			]
 		}
 		IA {
@@ -699,6 +700,7 @@ var jsClusterImportsTempl = `
 				{ service: { subject: "$JS.API.>", account: JS }}
 				{ service: { subject: "TEST", account: JS }}
 				{ service: { subject: "$JS.ACK.TEST.*.>", account: JS }}
+				{ service: { subject: "$JS.ACK.*.*.TEST.*.>", account: JS }}
 			]
 		}
 		$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
@@ -1174,7 +1176,7 @@ func (s *Server) reEnableLeafnodes() {
 // Helper to set the remote migrate feature.
 func (s *Server) setJetStreamMigrateOnRemoteLeaf() {
 	s.mu.Lock()
-	for _, cfg := range s.leafRemoteCfgs {
+	for cfg := range s.leafRemoteCfgs {
 		cfg.JetStreamClusterMigrate = true
 	}
 	s.mu.Unlock()
@@ -1183,7 +1185,7 @@ func (s *Server) setJetStreamMigrateOnRemoteLeaf() {
 // Helper to set the remote migrate feature.
 func (s *Server) setJetStreamMigrateOnRemoteLeafWithDelay(delay time.Duration) {
 	s.mu.Lock()
-	for _, cfg := range s.leafRemoteCfgs {
+	for cfg := range s.leafRemoteCfgs {
 		cfg.JetStreamClusterMigrate = true
 		cfg.JetStreamClusterMigrateDelay = delay
 	}
@@ -1326,6 +1328,27 @@ func jsStreamUpdate(t testing.TB, nc *nats.Conn, cfg *StreamConfig) (*StreamConf
 
 	require_NotNil(t, resp.StreamInfo)
 	return &resp.Config, nil
+}
+
+// jsConsumerCreate is for sending a consumer create for fields that nats.go does not know about yet.
+func jsConsumerCreate(t testing.TB, nc *nats.Conn, stream string, cfg ConsumerConfig, pedantic bool) (*ConsumerConfig, error) {
+	t.Helper()
+
+	j, err := json.Marshal(CreateConsumerRequest{Stream: stream, Config: cfg, Pedantic: pedantic})
+	require_NoError(t, err)
+
+	msg, err := nc.Request(fmt.Sprintf(JSApiDurableCreateT, stream, cfg.Durable), j, time.Second*3)
+	require_NoError(t, err)
+
+	var resp JSApiConsumerCreateResponse
+	require_NoError(t, json.Unmarshal(msg.Data, &resp))
+
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+
+	require_NotNil(t, resp.ConsumerInfo)
+	return resp.Config, nil
 }
 
 func checkSubsPending(t *testing.T, sub *nats.Subscription, numExpected int) {
@@ -2166,7 +2189,7 @@ func checkStateAndErr(t *testing.T, c *cluster, accountName, streamName string) 
 	mset, err := acc.lookupStream(streamName)
 	require_NoError(t, err)
 
-	cfgReplicas := mset.cfg.Replicas
+	cfgReplicas := mset.config().Replicas
 	foundReplicas := 1 // We already know the leader.
 	var errs []error
 	for _, srv := range c.servers {

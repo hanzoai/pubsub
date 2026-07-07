@@ -1,4 +1,4 @@
-# LLM.md - Hanzo PubSub
+# Hanzo PubSub
 
 ## Overview
 NATS server fork with Quasar PQ consensus, ZAP control plane, zapdb persistence,
@@ -16,7 +16,7 @@ JetStream (persistent streams/consumers/KV) enabled by default.
 - **ZAP mgmt** (port 9222): binary RPC control plane with HMAC auth
 - **ZAP consensus** (port 9223): Quasar P2P with BLS+PQ signature verification
 - **HTTP mgmt** (port 9280): REST API with bearer token auth
-- **Quasar consensus** (opt-in): dual PQ consensus (BLS + ML-DSA/Ringtail)
+- **Quasar consensus** (opt-in): dual PQ consensus (BLS + ML-DSA/Corona)
 - **zapdb store** (opt-in): embedded KV with AES-256 at rest + PQ-safe backup via age
 
 ## Storage Stack
@@ -28,10 +28,10 @@ PubSub streams → zapdb (AES-256 at rest) → age (ML-KEM-768+X25519) → S3/di
 - Restore: PQ-decrypted with luxfi/age HybridIdentity
 
 ## Quasar Consensus
-Upstream `luxfi/consensus` HEAD implements triple consensus (BLS + Ringtail + ML-DSA).
-PubSub pins `luxfi/consensus` v1.22.0 which has dual consensus (BLS + ML-DSA/Ringtail):
+Upstream `luxfi/consensus` HEAD implements triple consensus (BLS + Corona + ML-DSA).
+PubSub pins `luxfi/consensus` v1.22.0 which has dual consensus (BLS + ML-DSA/Corona):
 1. **BLS12-381** — classical fast-path, 48-byte aggregate proof
-2. **PQ proof** (ML-DSA-65 or Ringtail Ring-LWE) — post-quantum, variable size
+2. **PQ proof** (ML-DSA-65 or Corona Ring-LWE) — post-quantum, variable size
 
 Triple mode (`TripleSignRound1`, all 3 in parallel) available when pubsub upgrades to v1.23+.
 

@@ -14,11 +14,15 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -417,7 +421,7 @@ func TestClientProxyProtoV1ParseTCP4(t *testing.T) {
 	header := buildProxyV1Header(t, "TCP4", "192.168.1.50", "10.0.0.1", 12345, 4222)
 	conn := newMockConn(header)
 
-	addr, err := readProxyProtoHeader(conn)
+	addr, _, err := readProxyProtoHeader(conn)
 	require_NoError(t, err)
 	require_NotNil(t, addr)
 
@@ -432,7 +436,7 @@ func TestClientProxyProtoV1ParseTCP6(t *testing.T) {
 	header := buildProxyV1Header(t, "TCP6", "2001:db8::1", "2001:db8::2", 54321, 4222)
 	conn := newMockConn(header)
 
-	addr, err := readProxyProtoHeader(conn)
+	addr, _, err := readProxyProtoHeader(conn)
 	require_NoError(t, err)
 	require_NotNil(t, addr)
 
@@ -447,9 +451,24 @@ func TestClientProxyProtoV1ParseUnknown(t *testing.T) {
 	header := buildProxyV1Header(t, "UNKNOWN", "", "", 0, 0)
 	conn := newMockConn(header)
 
-	addr, err := readProxyProtoHeader(conn)
+	addr, _, err := readProxyProtoHeader(conn)
 	require_NoError(t, err)
 	require_True(t, addr == nil)
+}
+
+func TestClientProxyProtoV1PreservesCoalescedClientBytes(t *testing.T) {
+	header := buildProxyV1Header(t, "TCP4", "192.168.1.50", "10.0.0.1", 12345, 4222)
+	connect := []byte("CONNECT {\"verbose\":false,\"pedantic\":false,\"protocol\":1}\r\n")
+	conn := newMockConn(append(header, connect...))
+
+	addr, remaining, err := readProxyProtoHeader(conn)
+	require_NoError(t, err)
+	require_NotNil(t, addr)
+	require_Equal(t, string(remaining), string(connect))
+
+	rest, err := io.ReadAll(conn)
+	require_NoError(t, err)
+	require_Equal(t, len(rest), 0)
 }
 
 func TestClientProxyProtoV1InvalidFormat(t *testing.T) {
@@ -457,7 +476,7 @@ func TestClientProxyProtoV1InvalidFormat(t *testing.T) {
 	header := []byte("PROXY TCP4 192.168.1.1\r\n")
 	conn := newMockConn(header)
 
-	_, err := readProxyProtoHeader(conn)
+	_, _, err := readProxyProtoHeader(conn)
 	require_Error(t, err, errProxyProtoInvalid)
 }
 
@@ -467,7 +486,7 @@ func TestClientProxyProtoV1LineTooLong(t *testing.T) {
 	header := fmt.Appendf(nil, "PROXY TCP4 %s 10.0.0.1 12345 443\r\n", longIP)
 	conn := newMockConn(header)
 
-	_, err := readProxyProtoHeader(conn)
+	_, _, err := readProxyProtoHeader(conn)
 	require_Error(t, err, errProxyProtoInvalid)
 }
 
@@ -475,7 +494,7 @@ func TestClientProxyProtoV1InvalidIP(t *testing.T) {
 	header := []byte("PROXY TCP4 not.an.ip.addr 10.0.0.1 12345 443\r\n")
 	conn := newMockConn(header)
 
-	_, err := readProxyProtoHeader(conn)
+	_, _, err := readProxyProtoHeader(conn)
 	require_Error(t, err, errProxyProtoInvalid)
 }
 
@@ -484,14 +503,14 @@ func TestClientProxyProtoV1MismatchedProtocol(t *testing.T) {
 	header := buildProxyV1Header(t, "TCP4", "2001:db8::1", "2001:db8::2", 12345, 443)
 	conn := newMockConn(header)
 
-	_, err := readProxyProtoHeader(conn)
+	_, _, err := readProxyProtoHeader(conn)
 	require_Error(t, err, errProxyProtoInvalid)
 
 	// TCP6 with IPv4 address
 	header2 := buildProxyV1Header(t, "TCP6", "192.168.1.1", "10.0.0.1", 12345, 443)
 	conn2 := newMockConn(header2)
 
-	_, err = readProxyProtoHeader(conn2)
+	_, _, err = readProxyProtoHeader(conn2)
 	require_Error(t, err, errProxyProtoInvalid)
 }
 
@@ -499,7 +518,7 @@ func TestClientProxyProtoV1InvalidPort(t *testing.T) {
 	header := []byte("PROXY TCP4 192.168.1.1 10.0.0.1 99999 443\r\n")
 	conn := newMockConn(header)
 
-	_, err := readProxyProtoHeader(conn)
+	_, _, err := readProxyProtoHeader(conn)
 	require_True(t, err != nil)
 }
 
@@ -520,24 +539,27 @@ func TestClientProxyProtoV1EndToEnd(t *testing.T) {
 	require_NoError(t, err)
 	defer conn.Close()
 
-	// Send PROXY protocol v1 header
+	// Send the PROXY protocol header and first client commands in one write so
+	// the parser must preserve bytes read past the end of the v1 header.
 	clientIP, clientPort := "203.0.113.50", uint16(54321)
 	header := buildProxyV1Header(t, "TCP4", clientIP, "127.0.0.1", clientPort, 4222)
+	payload := append(header, []byte("CONNECT {\"verbose\":true,\"pedantic\":false,\"protocol\":1}\r\nPING\r\n")...)
 
-	_, err = conn.Write(header)
+	_, err = conn.Write(payload)
 	require_NoError(t, err)
 
-	// Send CONNECT message
-	_, err = conn.Write([]byte("CONNECT {\"verbose\":false,\"pedantic\":false,\"protocol\":1}\r\n"))
-	require_NoError(t, err)
+	require_NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	cr := bufio.NewReader(conn)
 
-	// Read INFO and +OK
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
+	line, err := cr.ReadString('\n')
 	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(line, "INFO "))
 
-	response := string(buf[:n])
-	require_True(t, strings.Contains(response, "INFO"))
+	line, err = cr.ReadString('\n')
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(line, "+OK"))
+
+	expectPong(t, cr)
 
 	// Give server time to process
 	time.Sleep(100 * time.Millisecond)
@@ -569,7 +591,7 @@ func TestClientProxyProtoVersionDetection(t *testing.T) {
 	v1Header := buildProxyV1Header(t, "TCP4", "192.168.1.1", "10.0.0.1", 12345, 443)
 	conn1 := newMockConn(v1Header)
 
-	addr1, err := readProxyProtoHeader(conn1)
+	addr1, _, err := readProxyProtoHeader(conn1)
 	require_NoError(t, err)
 	require_NotNil(t, addr1)
 	require_Equal(t, addr1.srcIP.String(), "192.168.1.1")
@@ -578,7 +600,7 @@ func TestClientProxyProtoVersionDetection(t *testing.T) {
 	v2Header := buildProxyV2Header(t, "192.168.1.2", "10.0.0.1", 54321, 443, proxyProtoFamilyInet)
 	conn2 := newMockConn(v2Header)
 
-	addr2, err := readProxyProtoHeader(conn2)
+	addr2, _, err := readProxyProtoHeader(conn2)
 	require_NoError(t, err)
 	require_NotNil(t, addr2)
 	require_Equal(t, addr2.srcIP.String(), "192.168.1.2")
@@ -589,6 +611,147 @@ func TestClientProxyProtoUnrecognizedVersion(t *testing.T) {
 	header := []byte("HELLO WORLD\r\n")
 	conn := newMockConn(header)
 
-	_, err := readProxyProtoHeader(conn)
+	_, _, err := readProxyProtoHeader(conn)
 	require_Error(t, err, errProxyProtoUnrecognized)
+}
+
+// ============================================================================
+// PROXY Protocol + TLS Tests (regression for issue #7571)
+// ============================================================================
+
+// runProxyProtoTLSServer starts a server with proxy_protocol and a required
+// TLS listener (no allow_non_tls, no tls_first).
+func runProxyProtoTLSServer(t *testing.T) *Server {
+	t.Helper()
+	tc := &TLSConfigOpts{
+		CertFile: "../test/configs/certs/server-cert.pem",
+		KeyFile:  "../test/configs/certs/server-key.pem",
+		CaFile:   "../test/configs/certs/ca.pem",
+	}
+	tlsConfig, err := GenTLSConfig(tc)
+	require_NoError(t, err)
+
+	opts := DefaultOptions()
+	opts.Port = -1
+	opts.ProxyProtocol = true
+	opts.TLSConfig = tlsConfig
+	opts.TLSTimeout = 2
+	return RunServer(opts)
+}
+
+// proxyProtoTLSClientConfig builds a tls.Config trusting the test CA. The
+// server cert is issued for "localhost" / 127.0.0.1, so ServerName must match.
+func proxyProtoTLSClientConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	caPEM, err := os.ReadFile("../test/configs/certs/ca.pem")
+	require_NoError(t, err)
+	pool := x509.NewCertPool()
+	require_True(t, pool.AppendCertsFromPEM(caPEM))
+	return &tls.Config{
+		RootCAs:    pool,
+		ServerName: "localhost",
+	}
+}
+
+// findProxyProtoClient finds a connected client whose host/port matches what
+// was advertised in the PROXY header.
+func findProxyProtoClient(t *testing.T, s *Server, clientIP string, clientPort uint16) *client {
+	t.Helper()
+	s.mu.Lock()
+	clients := make([]*client, 0, len(s.clients))
+	for _, c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.Unlock()
+
+	for _, c := range clients {
+		c.mu.Lock()
+		host, port := c.host, c.port
+		c.mu.Unlock()
+		if host == clientIP && port == clientPort {
+			return c
+		}
+	}
+	return nil
+}
+
+// connectProxyProtoTLS mirrors what an L4 proxy and a TLS-enabled NATS client
+// do over a single TCP connection: prepend the PROXY header, read the initial
+// plaintext INFO, then upgrade to TLS. Returns the buffered reader and the
+// TLS-wrapped connection for subsequent protocol writes.
+func connectProxyProtoTLS(t *testing.T, addr string, header []byte) (*bufio.Reader, *tls.Conn) {
+	t.Helper()
+	rawConn, err := net.Dial("tcp", addr)
+	require_NoError(t, err)
+	require_NoError(t, rawConn.SetDeadline(time.Now().Add(5*time.Second)))
+
+	_, err = rawConn.Write(header)
+	require_NoError(t, err)
+
+	// Server emits INFO over plaintext before the TLS upgrade. Read it now
+	// so the bytes don't end up as input to the TLS handshake.
+	plainReader := bufio.NewReader(rawConn)
+	infoLine, err := plainReader.ReadString('\n')
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(infoLine, "INFO "))
+	require_Equal(t, plainReader.Buffered(), 0)
+
+	tlsConn := tls.Client(rawConn, proxyProtoTLSClientConfig(t))
+	require_NoError(t, tlsConn.Handshake())
+	return bufio.NewReader(tlsConn), tlsConn
+}
+
+// TestClientProxyProtoV1WithRequiredTLS verifies that with proxy_protocol and
+// required TLS, a client may send the PROXY v1 header followed by the TLS
+// upgrade on a single TCP connection. Regression for issue #7571.
+func TestClientProxyProtoV1WithRequiredTLS(t *testing.T) {
+	s := runProxyProtoTLSServer(t)
+	defer s.Shutdown()
+
+	clientIP, clientPort := "203.0.113.50", uint16(54321)
+	header := buildProxyV1Header(t, "TCP4", clientIP, "127.0.0.1", clientPort, 4222)
+	cr, tlsConn := connectProxyProtoTLS(t, s.Addr().String(), header)
+	defer tlsConn.Close()
+
+	_, err := tlsConn.Write([]byte("CONNECT {\"verbose\":true,\"pedantic\":false,\"protocol\":1}\r\nPING\r\n"))
+	require_NoError(t, err)
+
+	line, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(line, "+OK"))
+	expectPong(t, cr)
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if findProxyProtoClient(t, s, clientIP, clientPort) == nil {
+			return fmt.Errorf("no client with PROXY-supplied host/port yet")
+		}
+		return nil
+	})
+}
+
+// TestClientProxyProtoV2WithRequiredTLS is the v2 counterpart to
+// TestClientProxyProtoV1WithRequiredTLS.
+func TestClientProxyProtoV2WithRequiredTLS(t *testing.T) {
+	s := runProxyProtoTLSServer(t)
+	defer s.Shutdown()
+
+	clientIP, clientPort := "203.0.113.51", uint16(54322)
+	header := buildProxyV2Header(t, clientIP, "127.0.0.1", clientPort, 4222, proxyProtoFamilyInet)
+	cr, tlsConn := connectProxyProtoTLS(t, s.Addr().String(), header)
+	defer tlsConn.Close()
+
+	_, err := tlsConn.Write([]byte("CONNECT {\"verbose\":true,\"pedantic\":false,\"protocol\":1}\r\nPING\r\n"))
+	require_NoError(t, err)
+
+	line, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(line, "+OK"))
+	expectPong(t, cr)
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if findProxyProtoClient(t, s, clientIP, clientPort) == nil {
+			return fmt.Errorf("no client with PROXY-supplied host/port yet")
+		}
+		return nil
+	})
 }

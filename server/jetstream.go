@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/minio/highwayhash"
+	"github.com/hanzoai/pubsub/server/gsl"
 	"github.com/hanzoai/pubsub/server/sysmem"
 	"github.com/hanzoai/pubsub/server/tpm"
 	"github.com/nats-io/nkeys"
@@ -102,22 +103,26 @@ type JetStreamAPIStats struct {
 // This is for internal accounting for JetStream for this server.
 type jetStream struct {
 	// These are here first because of atomics on 32bit systems.
-	apiInflight   int64
-	apiTotal      int64
-	apiErrors     int64
-	memReserved   int64
-	storeReserved int64
-	memUsed       int64
-	storeUsed     int64
-	queueLimit    int64
-	clustered     int32
-	mu            sync.RWMutex
-	srv           *Server
-	config        JetStreamConfig
-	cluster       *jetStreamCluster
-	accounts      map[string]*jsAccount
-	apiSubs       *Sublist
-	started       time.Time
+	apiInflight    int64
+	apiTotal       int64
+	apiErrors      int64
+	memMax         int64
+	memReserved    int64 // Requires JS lock to be held.
+	memUsed        int64
+	storeMax       int64
+	storeReserved  int64 // Requires JS lock to be held.
+	storeUsed      int64
+	queueLimit     int64
+	infoQueueLimit int64
+	clustered      int32
+	mu             sync.RWMutex
+	srv            *Server
+	config         JetStreamConfig
+	cluster        *jetStreamCluster
+	accounts       map[string]*jsAccount
+	apiSubs        *Sublist
+	infoSubs       *gsl.SimpleSublist // Subjects for info-specific queue.
+	started        time.Time
 
 	// System level request to purge a stream move
 	accountPurge *subscription
@@ -204,9 +209,6 @@ func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 			maxStore, maxMem = config.MaxStore, config.MaxMemory
 		}
 		config = s.dynJetStreamConfig(storeDir, maxStore, maxMem)
-		if maxMem > 0 {
-			config.MaxMemory = maxMem
-		}
 		if domain != _EMPTY_ {
 			config.Domain = domain
 		}
@@ -412,15 +414,19 @@ func (s *Server) initJetStreamEncryption() (err error) {
 
 // enableJetStream will start up the JetStream subsystem.
 func (s *Server) enableJetStream(cfg JetStreamConfig) error {
-	js := &jetStream{srv: s, config: cfg, accounts: make(map[string]*jsAccount), apiSubs: NewSublistNoCache()}
+	js := &jetStream{srv: s, config: cfg, accounts: make(map[string]*jsAccount), apiSubs: NewSublistNoCache(), infoSubs: gsl.NewSimpleSublist()}
 	s.gcbMu.Lock()
 	if s.gcbOutMax = s.getOpts().JetStreamMaxCatchup; s.gcbOutMax == 0 {
 		s.gcbOutMax = defaultMaxTotalCatchupOutBytes
 	}
 	s.gcbMu.Unlock()
 
+	atomic.StoreInt64(&js.memMax, cfg.MaxMemory)
+	atomic.StoreInt64(&js.storeMax, cfg.MaxStore)
+
 	// TODO: Not currently reloadable.
 	atomic.StoreInt64(&js.queueLimit, s.getOpts().JetStreamRequestQueueLimit)
+	atomic.StoreInt64(&js.infoQueueLimit, s.getOpts().JetStreamInfoQueueLimit)
 
 	s.js.Store(js)
 
@@ -568,7 +574,7 @@ func (s *Server) restartJetStream() error {
 	err := s.EnableJetStream(&cfg)
 	if err != nil {
 		s.Warnf("Can't start JetStream: %v", err)
-		return s.DisableJetStream()
+		return s.ShutdownJetStream()
 	}
 	s.updateJetStreamInfoStatus(true)
 	return nil
@@ -620,7 +626,7 @@ func (s *Server) handleOutOfSpace(mset *stream) {
 			s.Errorf("JetStream out of resources, will be DISABLED")
 		}
 
-		go s.DisableJetStream()
+		go s.ShutdownJetStream()
 
 		adv := &JSServerOutOfSpaceAdvisory{
 			TypedEvent: TypedEvent{
@@ -639,8 +645,23 @@ func (s *Server) handleOutOfSpace(mset *stream) {
 }
 
 // DisableJetStream will turn off JetStream and signals in clustered mode
-// to have the metacontroller remove us from the peer list.
+// to have the metacontroller remove us from the peer list. Persistent
+// meta-raft state on disk is removed. For transient runtime errors where
+// the server should rejoin its existing meta group on restart, use
+// ShutdownJetStream instead.
 func (s *Server) DisableJetStream() error {
+	return s.disableJetStream(true)
+}
+
+// ShutdownJetStream is like DisableJetStream but preserves persistent
+// meta-raft state on disk so the server can rejoin the existing meta
+// group on restart. Use for transient runtime errors that the operator
+// is expected to fix before restarting.
+func (s *Server) ShutdownJetStream() error {
+	return s.disableJetStream(false)
+}
+
+func (s *Server) disableJetStream(deleteState bool) error {
 	if !s.JetStreamEnabled() {
 		return nil
 	}
@@ -671,7 +692,12 @@ func (s *Server) DisableJetStream() error {
 					s.Warnf("JetStream timeout waiting for meta leader transfer")
 				}
 			}
-			meta.Delete()
+			if deleteState {
+				meta.Delete()
+			} else {
+				meta.Stop()
+				meta.WaitForStop()
+			}
 		}
 	}
 
@@ -1055,8 +1081,10 @@ func (s *Server) shutdownJetStream() {
 func (s *Server) JetStreamConfig() *JetStreamConfig {
 	var c *JetStreamConfig
 	if js := s.getJetStream(); js != nil {
+		js.mu.RLock()
 		copy := js.config
 		c = &(copy)
+		js.mu.RUnlock()
 	}
 	return c
 }
@@ -1503,7 +1531,7 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits, tq c
 		}
 
 		// Add in the stream.
-		mset, err := a.addStream(&cfg.StreamConfig)
+		mset, err := a.recoverStream(&cfg.StreamConfig)
 		if err != nil {
 			s.Warnf("  Error recreating stream %q: %v", cfg.Name, err)
 			// If we removed a keyfile from above make sure to put it back.
@@ -1545,13 +1573,13 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits, tq c
 			}
 			// We've observed a partial batch write. Write the remainder of the batch.
 			batchSeq++
-			_, batchStoreDir = getBatchStoreDir(mset, batchId)
+			_, batchStoreDir = getBatchStoreDir(jsa.storeDir, cfg.Name, batchId)
 			if _, err = os.Stat(batchStoreDir); err != nil {
 				s.Errorf("  Failed restoring partial batch write for stream '%s > %s' at sequence %d: %v",
 					mset.accName(), mset.name(), batchSeq, err)
 				goto SKIP
 			}
-			store, err = newBatchStore(mset, batchId)
+			store, err = newBatchStore(mset, batchId, cfg.Replicas, cfg.Storage, jsa.storeDir, cfg.Name)
 			if err != nil {
 				s.Errorf("  Failed restoring partial batch write for stream '%s > %s' at sequence %d: %v",
 					mset.accName(), mset.name(), batchSeq, err)
@@ -1800,13 +1828,15 @@ func diffCheckedLimits(a, b map[string]JetStreamAccountLimits) map[string]JetStr
 // Lock should be held.
 func (jsa *jsAccount) reservedStorage(tier string) (mem, store uint64) {
 	for _, mset := range jsa.streams {
-		cfg := &mset.cfg
-		if (tier == _EMPTY_ || tier == tierName(cfg.Replicas)) && cfg.MaxBytes > 0 {
-			switch cfg.Storage {
+		mset.cfgMu.RLock()
+		storage, replicas, maxBytes := mset.cfg.Storage, mset.cfg.Replicas, mset.cfg.MaxBytes
+		mset.cfgMu.RUnlock()
+		if (tier == _EMPTY_ || tier == tierName(replicas)) && maxBytes > 0 {
+			switch storage {
 			case FileStorage:
-				store += uint64(cfg.MaxBytes)
+				store += uint64(maxBytes)
 			case MemoryStorage:
-				mem += uint64(cfg.MaxBytes)
+				mem += uint64(maxBytes)
 			}
 		}
 	}
@@ -2299,14 +2329,14 @@ func (jsa *jsAccount) sendClusterUsageUpdate() {
 func (js *jetStream) wouldExceedLimits(storeType StorageType, sz int) bool {
 	var (
 		total *int64
-		max   int64
+		max   *int64
 	)
 	if storeType == MemoryStorage {
-		total, max = &js.memUsed, js.config.MaxMemory
+		total, max = &js.memUsed, &js.memMax
 	} else {
-		total, max = &js.storeUsed, js.config.MaxStore
+		total, max = &js.storeUsed, &js.storeMax
 	}
-	return (atomic.LoadInt64(total) + int64(sz)) > max
+	return (atomic.LoadInt64(total) + int64(sz)) > atomic.LoadInt64(max)
 }
 
 func (js *jetStream) limitsExceeded(storeType StorageType) bool {
@@ -2321,9 +2351,11 @@ func tierName(replicas int) string {
 	return fmt.Sprintf("R%d", replicas)
 }
 
-func isSameTier(cfgA, cfgB *StreamConfig) bool {
+func isSameTier(replicasA, replicasB int) bool {
+	a := max(1, replicasA)
+	b := max(1, replicasB)
 	// TODO (mh) this is where we could select based off a placement tag as well "qos:tier"
-	return cfgA.Replicas == cfgB.Replicas
+	return a == b
 }
 
 func (jsa *jsAccount) jetStreamAndClustered() (*jetStream, bool) {
@@ -2347,9 +2379,12 @@ func (jsa *jsAccount) selectLimits(replicas int) (JetStreamAccountLimits, string
 
 // Lock should be held.
 func (jsa *jsAccount) countStreams(tier string, cfg *StreamConfig) (streams int) {
-	for _, sa := range jsa.streams {
+	for _, mset := range jsa.streams {
+		mset.cfgMu.RLock()
+		name, replicas := mset.cfg.Name, mset.cfg.Replicas
+		mset.cfgMu.RUnlock()
 		// Don't count the stream toward the limit if it already exists.
-		if (tier == _EMPTY_ || isSameTier(&sa.cfg, cfg)) && sa.cfg.Name != cfg.Name {
+		if (tier == _EMPTY_ || isSameTier(replicas, cfg.Replicas)) && name != cfg.Name {
 			streams++
 		}
 	}
@@ -2398,17 +2433,11 @@ func (jsa *jsAccount) wouldExceedLimits(storeType StorageType, tierName string, 
 	// Since tiers are flat we need to scale limit up by replicas when checking.
 	if storeType == MemoryStorage {
 		totalMem := inUse.total.mem + (int64(memStoreMsgSize(subj, hdr, msg)) * r)
-		if selectedLimits.MemoryMaxStreamBytes > 0 && totalMem > selectedLimits.MemoryMaxStreamBytes*lr {
-			return true, nil
-		}
 		if selectedLimits.MaxMemory >= 0 && totalMem > selectedLimits.MaxMemory*lr {
 			return true, nil
 		}
 	} else {
 		totalStore := inUse.total.store + (int64(fileStoreMsgSize(subj, hdr, msg)) * r)
-		if selectedLimits.StoreMaxStreamBytes > 0 && totalStore > selectedLimits.StoreMaxStreamBytes*lr {
-			return true, nil
-		}
 		if selectedLimits.MaxStore >= 0 && totalStore > selectedLimits.MaxStore*lr {
 			return true, nil
 		}
@@ -2419,53 +2448,69 @@ func (jsa *jsAccount) wouldExceedLimits(storeType StorageType, tierName string, 
 
 // Check account limits.
 // Read Lock should be held
-func (js *jetStream) checkAccountLimits(selected *JetStreamAccountLimits, config *StreamConfig, currentRes int64) error {
-	return js.checkLimits(selected, config, false, currentRes, 0)
+func (js *jetStream) checkAccountLimits(selected *JetStreamAccountLimits, tier string, config *StreamConfig, currentRes int64) error {
+	return js.checkLimits(selected, tier, config, false, currentRes, 0)
 }
 
 // Check account and server limits.
 // Read Lock should be held
-func (js *jetStream) checkAllLimits(selected *JetStreamAccountLimits, config *StreamConfig, currentRes, maxBytesOffset int64) error {
-	return js.checkLimits(selected, config, true, currentRes, maxBytesOffset)
+func (js *jetStream) checkAllLimits(selected *JetStreamAccountLimits, tier string, config *StreamConfig, currentRes, maxBytesOffset int64) error {
+	return js.checkLimits(selected, tier, config, true, currentRes, maxBytesOffset)
 }
 
 // Check if a new proposed msg set while exceed our account limits.
 // Lock should be held.
-func (js *jetStream) checkLimits(selected *JetStreamAccountLimits, config *StreamConfig, checkServer bool, currentRes, maxBytesOffset int64) error {
+func (js *jetStream) checkLimits(selected *JetStreamAccountLimits, tier string, config *StreamConfig, checkServer bool, currentRes, maxBytesOffset int64) error {
 	// Check MaxConsumers
 	if config.MaxConsumers > 0 && selected.MaxConsumers > 0 && config.MaxConsumers > selected.MaxConsumers {
 		return NewJSMaximumConsumersLimitError()
 	}
 	// stream limit is checked separately on stream create only!
 	// Check storage, memory or disk.
-	return js.checkBytesLimits(selected, config.MaxBytes, config.Storage, checkServer, currentRes, maxBytesOffset)
+	return js.checkBytesLimits(selected, tier, config.MaxBytes, config.Replicas, config.Storage, checkServer, currentRes, maxBytesOffset)
+}
+
+// accountReservation returns how many bytes count against the account limit
+// for a stream with the given replica count. Un-tiered limits are flat, so R>1
+// is counted as Replicas*bytes; tiered limits already bake in replication.
+func accountReservation(tier string, replicas int, bytes int64) int64 {
+	if bytes <= 0 {
+		return 0
+	}
+	if tier == _EMPTY_ && replicas > 1 {
+		return mulSaturate(int64(replicas), bytes)
+	}
+	return bytes
 }
 
 // Check if additional bytes will exceed our account limits and optionally the server itself.
 // Read Lock should be held.
-func (js *jetStream) checkBytesLimits(selectedLimits *JetStreamAccountLimits, addBytes int64, storage StorageType, checkServer bool, currentRes, maxBytesOffset int64) error {
+func (js *jetStream) checkBytesLimits(selectedLimits *JetStreamAccountLimits, tier string, addBytes int64, replicas int, storage StorageType, checkServer bool, currentRes, maxBytesOffset int64) error {
 	if addBytes < 0 {
 		addBytes = 1
 	}
-	totalBytes := addBytes + maxBytesOffset
+	// The per-server footprint is a single replica's worth of bytes; the
+	// account footprint additionally accounts for replication in un-tiered setups.
+	serverBytes := addSaturate(addBytes, maxBytesOffset)
+	accountBytes := accountReservation(tier, replicas, serverBytes)
 
 	switch storage {
 	case MemoryStorage:
 		// Account limits defined.
-		if selectedLimits.MaxMemory >= 0 && currentRes+totalBytes > selectedLimits.MaxMemory {
+		if selectedLimits.MaxMemory >= 0 && (currentRes > selectedLimits.MaxMemory || accountBytes > selectedLimits.MaxMemory-currentRes) {
 			return NewJSMemoryResourcesExceededError()
 		}
 		// Check if this server can handle request.
-		if checkServer && js.memReserved+totalBytes > js.config.MaxMemory {
+		if checkServer && (js.memReserved > js.config.MaxMemory || serverBytes > js.config.MaxMemory-js.memReserved) {
 			return NewJSMemoryResourcesExceededError()
 		}
 	case FileStorage:
 		// Account limits defined.
-		if selectedLimits.MaxStore >= 0 && currentRes+totalBytes > selectedLimits.MaxStore {
+		if selectedLimits.MaxStore >= 0 && (currentRes > selectedLimits.MaxStore || accountBytes > selectedLimits.MaxStore-currentRes) {
 			return NewJSStorageResourcesExceededError()
 		}
 		// Check if this server can handle request.
-		if checkServer && js.storeReserved+totalBytes > js.config.MaxStore {
+		if checkServer && (js.storeReserved > js.config.MaxStore || serverBytes > js.config.MaxStore-js.storeReserved) {
 			return NewJSStorageResourcesExceededError()
 		}
 	}
@@ -2675,13 +2720,13 @@ func (s *Server) dynJetStreamConfig(storeDir string, maxStore, maxMem int64) *Je
 	jsc.SyncInterval = opts.SyncInterval
 	jsc.SyncAlways = opts.SyncAlways
 
-	if opts.maxStoreSet && maxStore >= 0 {
+	if maxStore > 0 || (opts.maxStoreSet && maxStore == 0) {
 		jsc.MaxStore = maxStore
 	} else {
 		jsc.MaxStore = diskAvailable(jsc.StoreDir)
 	}
 
-	if opts.maxMemSet && maxMem >= 0 {
+	if maxMem > 0 || (opts.maxMemSet && maxMem == 0) {
 		jsc.MaxMemory = maxMem
 	} else {
 		// Estimate to 75% of total memory if we can determine system memory.
@@ -2737,6 +2782,13 @@ func isValidName(name string) bool {
 		return false
 	}
 	return !strings.ContainsAny(name, " \t\r\n\f.*>")
+}
+
+func isValidAssetName(name string) bool {
+	if name == _EMPTY_ {
+		return false
+	}
+	return !strings.ContainsAny(name, " \t\r\n\f.*>\\/")
 }
 
 // To throttle the out of resources errors.
@@ -2859,7 +2911,7 @@ func (s *Server) handleWritePermissionError() {
 	if s.JetStreamEnabled() {
 		s.Errorf("File system permission denied while writing, disabling JetStream")
 
-		go s.DisableJetStream()
+		go s.ShutdownJetStream()
 
 		//TODO Send respective advisory if needed, same as in handleOutOfSpace
 	}

@@ -1,3 +1,5 @@
+<p align="center"><img src=".github/hero.svg" alt="pubsub" width="880"></p>
+
 # Hanzo PubSub
 
 High-performance event streaming and message queue for modern distributed systems.

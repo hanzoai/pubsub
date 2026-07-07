@@ -24,11 +24,10 @@ import (
 	"github.com/hanzoai/pubsub/internal/store"
 )
 
-// Type aliases — the published v1.22.0 uses legacy "Hybrid" names.
-// We alias to the correct names here; a new release will export these directly.
+// Type aliases to the upstream consensus quasar primitives.
 type (
-	QuasarConsensus = quasar.QuasarHybridConsensus
-	QuasarSignature = quasar.HybridSignature
+	QuasarConsensus = quasar.Quasar
+	QuasarSignature = quasar.QuasarSig
 )
 
 // maxPendingOps caps the pending map size to prevent OOM from proposal spam.
@@ -49,7 +48,7 @@ const (
 	fldOpJSON      = 8  // bytes: JSON-encoded Op
 	fldValidatorID = 16 // text: validator ID
 	fldSigBLS      = 24 // bytes: BLS signature
-	fldSigRingtail = 32 // bytes: Ringtail/ML-DSA signature
+	fldSigCorona = 32 // bytes: Corona/ML-DSA signature
 	fldHeight      = 40 // uint64: finalized height
 	fldSinceHeight = 48 // uint64: sync from height
 
@@ -170,13 +169,19 @@ func New(cfg Config) (*Quasar, error) {
 		cfg.ZAPPort = 0
 	}
 
-	signer, err := quasar.NewQuasarHybridConsensus(cfg.Threshold)
+	// Production BFT consensus requires threshold >= 2 (NewQuasar). A threshold
+	// of 1 is a single-node/dev topology, which upstream exposes via NewTestQuasar.
+	newSigner := quasar.NewQuasar
+	if cfg.Threshold < 2 {
+		newSigner = quasar.NewTestQuasar
+	}
+	signer, err := newSigner(cfg.Threshold)
 	if err != nil {
 		return nil, fmt.Errorf("quasar: init signer: %w", err)
 	}
 
 	for _, id := range cfg.ValidatorIDs {
-		if err := signer.AddValidator(id, 1); err != nil {
+		if _, err := signer.AddValidator(id, 1); err != nil {
 			return nil, fmt.Errorf("quasar: add validator %s: %w", id, err)
 		}
 	}
@@ -315,7 +320,7 @@ func (q *Quasar) addVoteLocked(hash string, validatorID string, sig *QuasarSigna
 	if err != nil || len(hashBytes) == 0 {
 		return false
 	}
-	if !q.signer.VerifyHybridSignature(hashBytes, sig) {
+	if !q.signer.VerifyQuasarSig(hashBytes, sig) {
 		return false
 	}
 
@@ -437,7 +442,7 @@ func (q *Quasar) sendVote(ctx context.Context, peerID string, hash string, sig *
 	obj.SetText(fldHash, hash)
 	obj.SetText(fldValidatorID, q.validatorID)
 	obj.SetBytes(fldSigBLS, sig.BLS)
-	obj.SetBytes(fldSigRingtail, sig.Ringtail)
+	obj.SetBytes(fldSigCorona, sig.Corona)
 	obj.FinishAsRoot()
 
 	msg, err := zap.Parse(b.Finish())
@@ -511,7 +516,7 @@ func (q *Quasar) handleVote(_ context.Context, from string, msg *zap.Message) (*
 	hash := root.Text(fldHash)
 	validatorID := root.Text(fldValidatorID)
 	bls := root.Bytes(fldSigBLS)
-	ringtail := root.Bytes(fldSigRingtail)
+	corona := root.Bytes(fldSigCorona)
 
 	if hash == "" || validatorID == "" {
 		return zapConsensusError("invalid vote")
@@ -533,7 +538,7 @@ func (q *Quasar) handleVote(_ context.Context, from string, msg *zap.Message) (*
 
 	sig := &QuasarSignature{
 		BLS:         bls,
-		Ringtail:    ringtail,
+		Corona:    corona,
 		ValidatorID: validatorID,
 	}
 
