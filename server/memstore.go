@@ -123,7 +123,7 @@ func (ms *memStore) UpdateConfig(cfg *StreamConfig) error {
 	maxp := ms.maxp
 	ms.maxp = cfg.MaxMsgsPer
 	// If the value is smaller, or was unset before, we need to enforce that.
-	if ms.maxp > 0 && (maxp == 0 || ms.maxp < maxp) {
+	if ms.maxp > 0 && (maxp <= 0 || ms.maxp < maxp) {
 		lm := uint64(ms.maxp)
 		ms.fss.IterFast(func(subj []byte, ss *SimpleState) bool {
 			if ss.Msgs > lm {
@@ -184,7 +184,7 @@ func (ms *memStore) recoverMsgSchedulingState() {
 		if len(sm.hdr) == 0 {
 			continue
 		}
-		if schedule, ok := nextMessageSchedule(sm.hdr, sm.ts); ok && !schedule.IsZero() {
+		if schedule, apiErr := nextMessageSchedule(sm.hdr, sm.ts); apiErr == nil && !schedule.IsZero() {
 			ms.scheduling.init(seq, sm.subj, schedule.UnixNano())
 		}
 	}
@@ -211,7 +211,9 @@ func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 	// If we are clustered, we do the enforcement above and should not disqualify
 	// the message here since it could cause replicas to drift.
 	if discardNewCheck && ms.cfg.Discard == DiscardNew {
-		if asl && ms.cfg.DiscardNewPer {
+		// Allow rollup messages through since they will purge old
+		// messages for the subject after storing, restoring the limit.
+		if asl && ms.cfg.DiscardNewPer && len(sliceHeader(JSMsgRollup, hdr)) == 0 {
 			return ErrMaxMsgsPerSubject
 		}
 		if ms.cfg.MaxMsgs > 0 && ms.state.Msgs >= uint64(ms.cfg.MaxMsgs) {
@@ -307,9 +309,9 @@ func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 
 	// Message scheduling.
 	if ms.scheduling != nil {
-		if schedule, ok := nextMessageSchedule(hdr, ts); ok && !schedule.IsZero() {
+		if schedule, apiErr := nextMessageSchedule(hdr, ts); apiErr == nil && !schedule.IsZero() {
 			ms.scheduling.add(seq, subj, schedule.UnixNano())
-		} else {
+		} else if getMessageScheduler(hdr) == _EMPTY_ {
 			ms.scheduling.removeSubject(subj)
 		}
 
@@ -421,8 +423,9 @@ func (ms *memStore) SkipMsgs(seq uint64, num uint64) error {
 }
 
 // FlushAllPending flushes all data that was still pending to be written.
-func (ms *memStore) FlushAllPending() {
+func (ms *memStore) FlushAllPending() error {
 	// Noop, in-memory store doesn't use async applying.
+	return nil
 }
 
 // RegisterStorageUpdates registers a callback for updates to storage changes.
@@ -528,13 +531,13 @@ loop:
 }
 
 // FilteredState will return the SimpleState associated with the filtered subject and a proposed starting sequence.
-func (ms *memStore) FilteredState(sseq uint64, subj string) SimpleState {
+func (ms *memStore) FilteredState(sseq uint64, subj string) (SimpleState, error) {
 	// This needs to be a write lock, as filteredStateLocked can
 	// mutate the per-subject state.
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
-	return ms.filteredStateLocked(sseq, subj, false)
+	return ms.filteredStateLocked(sseq, subj, false), nil
 }
 
 func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubject bool) SimpleState {
@@ -826,8 +829,8 @@ func (ms *memStore) filterIsAll(filters []string) bool {
 // MultiLastSeqs will return a sorted list of sequences that match all subjects presented in filters.
 // We will not exceed the maxSeq, which if 0 becomes the store's last sequence.
 func (ms *memStore) MultiLastSeqs(filters []string, maxSeq uint64, maxAllowed int) ([]uint64, error) {
-	ms.mu.RLock()
-	defer ms.mu.RUnlock()
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 
 	if len(ms.msgs) == 0 {
 		return nil, nil
@@ -855,6 +858,9 @@ func (ms *memStore) MultiLastSeqs(filters []string, maxSeq uint64, maxAllowed in
 
 	for _, filter := range filters {
 		ms.fss.Match(stringToBytes(filter), func(subj []byte, ss *SimpleState) {
+			if ss.lastNeedsUpdate {
+				ms.recalculateForSubj(bytesToString(subj), ss)
+			}
 			if ss.Last <= maxSeq {
 				addIfNotDupe(ss.Last)
 			} else if ss.Msgs > 1 {
@@ -955,7 +961,7 @@ func (ms *memStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPerS
 	var havePartial bool
 	var totalSkipped uint64
 	// We will track start and end sequences as we go.
-	stree.IntersectGSL[SimpleState](ms.fss, sl, func(subj []byte, fss *SimpleState) {
+	stree.IntersectGSL[SimpleState](ms.fss, sl, func(subj []byte, fss *SimpleState) bool {
 		if fss.firstNeedsUpdate || fss.lastNeedsUpdate {
 			ms.recalculateForSubj(bytesToString(subj), fss)
 		}
@@ -969,6 +975,7 @@ func (ms *memStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPerS
 		} else {
 			totalSkipped += fss.Msgs
 		}
+		return true
 	})
 
 	// If we did not encounter any partials we can return here.
@@ -1420,48 +1427,70 @@ func (ms *memStore) runMsgScheduling() {
 // PurgeEx will remove messages based on subject filters, sequence and number of messages to keep.
 // Will return the number of purged messages.
 func (ms *memStore) PurgeEx(subject string, sequence, keep uint64) (purged uint64, err error) {
+	// sequence == 1 means "purge up to but not including 1", a no-op.
+	if sequence == 1 {
+		return 0, nil
+	}
 	if subject == _EMPTY_ || subject == fwcs {
 		if keep == 0 && sequence == 0 {
 			return ms.purge(0)
 		}
 		if sequence > 1 {
 			return ms.compact(sequence)
-		} else if keep > 0 {
-			ms.mu.RLock()
-			msgs, lseq := ms.state.Msgs, ms.state.LastSeq
-			ms.mu.RUnlock()
-			if keep >= msgs {
-				return 0, nil
-			}
-			return ms.compact(lseq - keep + 1)
 		}
-		return 0, nil
-
+		// Make sure to not leave subject if empty.
+		if subject == _EMPTY_ {
+			subject = fwcs
+		}
 	}
 	eq := compareFn(subject)
-	if ss := ms.FilteredState(1, subject); ss.Msgs > 0 {
-		if keep > 0 {
-			if keep >= ss.Msgs {
-				return 0, nil
-			}
-			ss.Msgs -= keep
+
+	// FilteredState narrows the search range.
+	ss, _ := ms.FilteredState(1, subject)
+	if ss.Msgs == 0 {
+		return 0, nil
+	}
+	// If we have a "keep" designation need to know how many to purge.
+	var maxp uint64
+	if keep > 0 {
+		if keep >= ss.Msgs {
+			return 0, nil
 		}
-		last := ss.Last
-		if sequence > 1 {
-			last = sequence - 1
-		}
-		ms.mu.Lock()
-		for seq := ss.First; seq <= last; seq++ {
-			if sm, ok := ms.msgs[seq]; ok && eq(sm.subj, subject) {
-				if ok := ms.removeMsg(sm.seq, false); ok {
-					purged++
-					if purged >= ss.Msgs {
-						break
-					}
+		maxp = ss.Msgs - keep
+	}
+	// "Purge up to but not including sequence": sequence == 0 means no
+	// sequence filter; sequence >= 1 clamps the upper bound to sequence-1
+	// (so sequence == 1 purges nothing).
+	last := ss.Last
+	if sequence >= 1 {
+		last = sequence - 1
+	}
+	var bytes, lowSeq uint64
+	var lowSubj string
+	ms.mu.Lock()
+	for seq := ss.First; seq <= last; seq++ {
+		if sm, ok := ms.msgs[seq]; ok && eq(sm.subj, subject) {
+			if subj, sz, ok := ms.removeMsgNoCB(sm.seq, false); ok {
+				purged++
+				bytes += sz
+				if lowSeq == 0 {
+					lowSeq, lowSubj = sm.seq, subj
+				}
+				if maxp > 0 && purged >= maxp {
+					break
 				}
 			}
 		}
-		ms.mu.Unlock()
+	}
+	cb := ms.scb
+	ms.mu.Unlock()
+
+	if cb != nil && purged > 0 {
+		if purged == 1 {
+			cb(-1, -int64(bytes), lowSeq, lowSubj)
+		} else {
+			cb(-int64(purged), -int64(bytes), 0, _EMPTY_)
+		}
 	}
 	return purged, nil
 }
@@ -1921,31 +1950,41 @@ func (ms *memStore) loadNextMsgLocked(filter string, wc bool, start uint64, smp 
 	return nil, ms.state.LastSeq, ErrStoreEOF
 }
 
-// Will load the next non-deleted msg starting at the start sequence and walking backwards.
-func (ms *memStore) LoadPrevMsg(start uint64, smp *StoreMsg) (sm *StoreMsg, err error) {
+// Will load the previous message matching the filter subject, starting at the start sequence and walking backwards.
+func (ms *memStore) LoadPrevMsg(filter string, wc bool, start uint64, smp *StoreMsg) (sm *StoreMsg, skip uint64, err error) {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
 
 	if ms.msgs == nil {
-		return nil, ErrStoreClosed
+		return nil, 0, ErrStoreClosed
 	}
 	if ms.state.Msgs == 0 || start < ms.state.FirstSeq {
-		return nil, ErrStoreEOF
+		return nil, ms.state.FirstSeq, ErrStoreEOF
 	}
 	if start > ms.state.LastSeq {
 		start = ms.state.LastSeq
 	}
 
+	if filter == _EMPTY_ {
+		filter = fwcs
+		wc = true
+	}
+	isAll := filter == fwcs
+	eq := subjectsEqual
+	if wc {
+		eq = matchLiteral
+	}
+
 	for seq := start; seq >= ms.state.FirstSeq; seq-- {
-		if sm, ok := ms.msgs[seq]; ok {
+		if sm, ok := ms.msgs[seq]; ok && (isAll || eq(sm.subj, filter)) {
 			if smp == nil {
 				smp = new(StoreMsg)
 			}
 			sm.copy(smp)
-			return smp, nil
+			return smp, seq, nil
 		}
 	}
-	return nil, ErrStoreEOF
+	return nil, ms.state.FirstSeq, ErrStoreEOF
 }
 
 // LoadPrevMsgMulti will find the previous message matching any entry in the sublist.
@@ -1979,7 +2018,7 @@ func (ms *memStore) LoadPrevMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *S
 			return smp, nseq, nil
 		}
 	}
-	return nil, ms.state.LastSeq, ErrStoreEOF
+	return nil, ms.state.FirstSeq, ErrStoreEOF
 }
 
 // RemoveMsg will remove the message from this store.
@@ -2108,20 +2147,38 @@ func (ms *memStore) recalculateForSubj(subj string, ss *SimpleState) {
 // Removes the message referenced by seq.
 // Lock should be held.
 func (ms *memStore) removeMsg(seq uint64, secure bool) bool {
-	var ss uint64
-	sm, ok := ms.msgs[seq]
+	subj, size, ok := ms.removeMsgNoCB(seq, secure)
 	if !ok {
 		return false
 	}
+	if ms.scb != nil {
+		// We do not want to hold any locks here.
+		ms.mu.Unlock()
+		if ms.scb != nil {
+			ms.scb(-1, -int64(size), seq, subj)
+		}
+		ms.mu.Lock()
+	}
+	return true
+}
 
-	ss = memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
+// Removes the message referenced by seq, but without calling the storage callback.
+// Returns the removed message's subject and size.
+// Lock should be held.
+func (ms *memStore) removeMsgNoCB(seq uint64, secure bool) (subj string, size uint64, ok bool) {
+	sm, ok := ms.msgs[seq]
+	if !ok {
+		return _EMPTY_, 0, false
+	}
+
+	size = memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
 
 	if ms.state.Msgs > 0 {
 		ms.state.Msgs--
-		if ss > ms.state.Bytes {
-			ss = ms.state.Bytes
+		if size > ms.state.Bytes {
+			size = ms.state.Bytes
 		}
-		ms.state.Bytes -= ss
+		ms.state.Bytes -= size
 	}
 	ms.dmap.Insert(seq)
 	ms.updateFirstSeq(seq)
@@ -2150,17 +2207,7 @@ func (ms *memStore) removeMsg(seq uint64, secure bool) bool {
 	// Must delete message after updating per-subject info, to be consistent with file store.
 	delete(ms.msgs, seq)
 
-	if ms.scb != nil {
-		// We do not want to hold any locks here.
-		ms.mu.Unlock()
-		if ms.scb != nil {
-			delta := int64(ss)
-			ms.scb(-1, -delta, seq, sm.subj)
-		}
-		ms.mu.Lock()
-	}
-
-	return ok
+	return sm.subj, size, true
 }
 
 // Type returns the type of the underlying store.
@@ -2190,8 +2237,8 @@ func (ms *memStore) FastState(state *StreamState) {
 }
 
 func (ms *memStore) State() StreamState {
-	ms.mu.RLock()
-	defer ms.mu.RUnlock()
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 
 	state := ms.state
 	state.Consumers = ms.consumers
@@ -2343,10 +2390,7 @@ func (ms *memStore) EncodedStreamState(failed uint64) ([]byte, error) {
 	b := buf[0:n]
 
 	if numDeleted > 0 {
-		buf, err := ms.dmap.Encode(nil)
-		if err != nil {
-			return nil, err
-		}
+		buf := ms.dmap.Encode(nil)
 		b = append(b, buf...)
 	}
 
@@ -2354,7 +2398,11 @@ func (ms *memStore) EncodedStreamState(failed uint64) ([]byte, error) {
 }
 
 // SyncDeleted will make sure this stream has same deleted state as dbs.
-func (ms *memStore) SyncDeleted(dbs DeleteBlocks) {
+func (ms *memStore) SyncDeleted(dbs DeleteBlocks) error {
+	if len(dbs) == 0 {
+		return nil
+	}
+
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
@@ -2363,7 +2411,7 @@ func (ms *memStore) SyncDeleted(dbs DeleteBlocks) {
 	if len(dbs) == 1 {
 		min, max, num := ms.dmap.State()
 		if pmin, pmax, pnum := dbs[0].State(); pmin == min && pmax == max && pnum == num {
-			return
+			return nil
 		}
 	}
 	lseq := ms.state.LastSeq
@@ -2377,6 +2425,7 @@ func (ms *memStore) SyncDeleted(dbs DeleteBlocks) {
 			return true
 		})
 	}
+	return nil
 }
 
 func (o *consumerMemStore) Update(state *ConsumerState) error {
@@ -2413,8 +2462,48 @@ func (o *consumerMemStore) Update(state *ConsumerState) error {
 
 	// Check to see if this is an outdated update.
 	if state.Delivered.Consumer < o.state.Delivered.Consumer || state.AckFloor.Stream < o.state.AckFloor.Stream {
-		return fmt.Errorf("old update ignored")
+		return ErrStoreOldUpdate
 	}
+
+	o.state.Delivered = state.Delivered
+	o.state.AckFloor = state.AckFloor
+	o.state.Pending = pending
+	o.state.Redelivered = redelivered
+
+	return nil
+}
+
+func (o *consumerMemStore) ForceUpdate(state *ConsumerState) error {
+	// Sanity checks.
+	if state.AckFloor.Consumer > state.Delivered.Consumer {
+		return fmt.Errorf("bad ack floor for consumer")
+	}
+	if state.AckFloor.Stream > state.Delivered.Stream {
+		return fmt.Errorf("bad ack floor for stream")
+	}
+
+	// Copy to our state.
+	var pending map[uint64]*Pending
+	var redelivered map[uint64]uint64
+	if len(state.Pending) > 0 {
+		pending = make(map[uint64]*Pending, len(state.Pending))
+		for seq, p := range state.Pending {
+			pending[seq] = &Pending{p.Sequence, p.Timestamp}
+			if seq <= state.AckFloor.Stream || seq > state.Delivered.Stream {
+				return fmt.Errorf("bad pending entry, sequence [%d] out of range", seq)
+			}
+		}
+	}
+	if len(state.Redelivered) > 0 {
+		redelivered = make(map[uint64]uint64, len(state.Redelivered))
+		for seq, dc := range state.Redelivered {
+			redelivered[seq] = dc
+		}
+	}
+
+	// Replace our state.
+	o.mu.Lock()
+	defer o.mu.Unlock()
 
 	o.state.Delivered = state.Delivered
 	o.state.AckFloor = state.AckFloor
@@ -2537,18 +2626,20 @@ func (o *consumerMemStore) UpdateAcks(dseq, sseq uint64) error {
 		return ErrNoAckPolicy
 	}
 
+	// We do this regardless.
+	delete(o.state.Redelivered, sseq)
+
 	// On restarts the old leader may get a replay from the raft logs that are old.
 	if dseq <= o.state.AckFloor.Consumer {
 		return nil
 	}
 
 	if len(o.state.Pending) == 0 || o.state.Pending[sseq] == nil {
-		delete(o.state.Redelivered, sseq)
 		return ErrStoreMsgNotFound
 	}
 
-	// Check for AckAll here.
-	if o.cfg.AckPolicy == AckAll {
+	// Check for AckAll here (or AckFlowControl which functions like AckAll).
+	if o.cfg.AckPolicy == AckAll || o.cfg.AckPolicy == AckFlowControl {
 		sgap := sseq - o.state.AckFloor.Stream
 		o.state.AckFloor.Consumer = dseq
 		o.state.AckFloor.Stream = sseq
@@ -2597,10 +2688,21 @@ func (o *consumerMemStore) UpdateAcks(dseq, sseq uint64) error {
 			}
 		}
 	}
-	// We do these regardless.
-	delete(o.state.Redelivered, sseq)
 
 	return nil
+}
+
+func (o *consumerMemStore) RemoveRedeliveredBelow(seq uint64) {
+	if seq == 0 {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for s := range o.state.Redelivered {
+		if s < seq {
+			delete(o.state.Redelivered, s)
+		}
+	}
 }
 
 func (o *consumerMemStore) UpdateConfig(cfg *ConsumerConfig) error {

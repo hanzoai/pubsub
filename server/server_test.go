@@ -200,6 +200,44 @@ func TestStartupAndShutdown(t *testing.T) {
 	}
 }
 
+func TestConcurrentShutdown(t *testing.T) {
+	opts := DefaultOptions()
+	opts.DisableShortFirstPing = true
+	opts.Accounts = []*Account{NewAccount("$SYS")}
+	opts.SystemAccount = "$SYS"
+
+	s := RunServer(opts)
+	if !s.EventsEnabled() {
+		t.Fatal("Expected events to be enabled")
+	}
+
+	const callers = 32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			s.Shutdown()
+		}()
+	}
+	close(start)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timed out waiting for concurrent shutdown calls")
+	}
+	s.WaitForShutdown()
+}
+
 func TestTLSVersions(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -258,7 +296,7 @@ func TestTLSMinVersionConfig(t *testing.T) {
 	// Cannot connect with client requiring a lower minimum TLS Version.
 	connect(t, &tls.Config{
 		MaxVersion: tls.VersionTLS12,
-	}, errors.New(`remote error: tls: protocol version not supported`))
+	}, errors.New(`nats: tls error: remote error: tls: protocol version not supported`))
 
 	// Should connect since matching minimum TLS version.
 	connect(t, &tls.Config{
@@ -586,6 +624,17 @@ func TestMaxConnections(t *testing.T) {
 		nc2.Close()
 		t.Fatal("Expected connection to fail")
 	}
+}
+
+func TestMaxConnectionsPreventsAll(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxConn = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	addr := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	_, err := nats.Connect(addr)
+	require_Error(t, err)
 }
 
 func TestMaxSubscriptions(t *testing.T) {
