@@ -50,7 +50,6 @@ require (
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/luxfi/accel v1.2.2 // indirect
-	github.com/luxfi/codec v1.1.4 // indirect
 	github.com/luxfi/corona v0.7.6 // indirect
 	github.com/luxfi/crypto v1.19.17 // indirect
 	github.com/luxfi/crypto/ipa v1.2.4 // indirect
