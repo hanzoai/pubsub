@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/antithesishq/antithesis-sdk-go v0.7.0
 	github.com/google/go-tpm v0.9.8
-	github.com/hanzoai/pubsub-go v1.0.1-0.20260513042624-1b25bdfe16a6
+	github.com/hanzoai/pubsub-go v1.53.0
 	github.com/klauspost/compress v1.18.6
 	github.com/luxfi/age v1.6.0
 	github.com/luxfi/consensus v1.36.2
