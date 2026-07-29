@@ -34,6 +34,17 @@ import (
 // failing closed.
 const readyTimeout = 10 * time.Second
 
+// DefaultMaxPayload is the bus's message-body ceiling when Options.MaxPayload is
+// unset: 8 MiB, eight times NATS's own 1 MiB default.
+//
+// 1 MiB is too small for the traffic this bus actually carries. The Kafka-wire
+// adaptor rides it, and its clients size themselves in MiB — insights' ingestion
+// consumer alone runs a 10 MiB fetch ceiling — so a 1 MiB bus silently caps every
+// one of them, and the failure lands on the PRODUCER as "Message size too large".
+// Consumer-side tuning cannot fix that, which is what makes it so easy to chase
+// in the wrong direction.
+const DefaultMaxPayload int32 = 8 << 20
+
 // Options configures an embedded PubSub server. StoreDir is required; every
 // other field has a working default.
 type Options struct {
@@ -47,6 +58,16 @@ type Options struct {
 	// StoreDir is the JetStream file-storage root. Required — JetStream is
 	// always on in an embedded server.
 	StoreDir string
+	// MaxPayload is the largest message body the bus will accept, in bytes
+	// (default DefaultMaxPayload). It is the hard ceiling on everything that
+	// rides this server, including the Kafka-wire adaptor: a producer whose
+	// record exceeds it gets "Message size too large" and cannot make progress
+	// — and a client that treats that as fatal will crash-loop forever, because
+	// no amount of consumer-side tuning can widen a producer-side ceiling.
+	//
+	// Left unset this inherited NATS's own 1 MiB default, which is far too small
+	// for analytics batches and was never a decision anyone made. Declare it.
+	MaxPayload int32
 	// Debug and Trace raise the core server's log verbosity.
 	Debug bool
 	Trace bool
@@ -71,6 +92,13 @@ func intOr(v, def int) int {
 	return v
 }
 
+func int32Or(v, def int32) int32 {
+	if v == 0 {
+		return def
+	}
+	return v
+}
+
 // Open constructs and starts the core NATS + JetStream server. It blocks only
 // until the accept loop is ready (bounded by readyTimeout) and returns; a
 // failure tears down partial state and returns an error, so the caller fails
@@ -86,6 +114,7 @@ func Open(o Options) (*Server, error) {
 		ServerName: strOr(o.ServerName, "pubsub-embedded"),
 		JetStream:  true,
 		StoreDir:   o.StoreDir,
+		MaxPayload: int32Or(o.MaxPayload, DefaultMaxPayload),
 		NoSigs:     true, // the host owns process signals
 		Debug:      o.Debug,
 		Trace:      o.Trace,

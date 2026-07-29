@@ -74,3 +74,55 @@ func TestOpenServesCoreAndJetStream(t *testing.T) {
 		t.Fatalf("js publish seq: got %d, want 1", ack.Sequence)
 	}
 }
+
+// TestMaxPayloadDefaultsAboveNATSOwn proves the bus does NOT silently inherit
+// NATS's 1 MiB default. That default is what wedged insights' ingestion loop:
+// the Kafka-wire adaptor rides this server, so a >1 MiB produce failed with
+// "Broker: Message size too large", the plugin treated it as an unhandled
+// rejection and exited(1), and it crash-looped. The failure is on the PRODUCER,
+// so no consumer-side fetch tuning could ever clear it.
+func TestMaxPayloadDefaultsAboveNATSOwn(t *testing.T) {
+	s, err := Open(Options{Port: -1, ServerName: "embed-maxpayload-default", StoreDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Shutdown()
+
+	const natsOwnDefault = 1 << 20
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+
+	// What the client is TOLD is what bounds it — this is the same value the
+	// production server advertised as max_payload=1048576.
+	got := nc.MaxPayload()
+	if got != int64(DefaultMaxPayload) {
+		t.Fatalf("advertised MaxPayload = %d, want DefaultMaxPayload %d", got, DefaultMaxPayload)
+	}
+	if got <= natsOwnDefault {
+		t.Fatalf("MaxPayload %d must exceed NATS's own %d default", got, natsOwnDefault)
+	}
+}
+
+// TestMaxPayloadHonoursExplicit proves an explicit ceiling reaches the server,
+// so an operator can raise it without a code change.
+func TestMaxPayloadHonoursExplicit(t *testing.T) {
+	const want = 32 << 20
+	s, err := Open(Options{Port: -1, ServerName: "embed-maxpayload-explicit", StoreDir: t.TempDir(), MaxPayload: want})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+
+	if got := nc.MaxPayload(); got != int64(want) {
+		t.Fatalf("advertised MaxPayload = %d, want %d", got, want)
+	}
+}
