@@ -1,6 +1,6 @@
 module github.com/hanzoai/pubsub
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/antithesishq/antithesis-sdk-go v0.7.0
