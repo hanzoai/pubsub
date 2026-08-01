@@ -1,4 +1,8 @@
 FROM --platform=$BUILDPLATFORM golang:alpine AS builder
+# go.mod pins the toolchain. The golang base image sets GOTOOLCHAIN=local,
+# which turns a `go` directive newer than the image into a hard build
+# failure instead of a download.
+ENV GOTOOLCHAIN=auto
 
 ARG VERSION="nightly"
 ARG GIT_COMMIT
