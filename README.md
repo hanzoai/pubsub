@@ -137,4 +137,4 @@ async def main():
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+Apache-2.0 — see [LICENSE](LICENSE); upstream attribution in [NOTICE](NOTICE).
