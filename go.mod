@@ -104,7 +104,8 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-// We don't usually pin non-tagged commits but so far no release has
-// been made that includes https://github.com/minio/highwayhash/pull/29.
-// This will be updated if a new tag covers this in the future.
-require github.com/minio/highwayhash v1.0.4
+// The hanzos3 fork of highwayhash, same code as the upstream v1.0.4 it
+// replaces, with the module path renamed so nothing here depends on minio.
+// (This note used to explain an upstream pin waiting on minio/highwayhash#29;
+// that PR is in v1.0.4, so the explanation had already outlived the pin.)
+require github.com/hanzos3/highwayhash v1.0.5
