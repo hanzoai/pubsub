@@ -26,7 +26,6 @@ import (
 	"math/rand"
 	"net/url"
 	os "os"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"slices"
