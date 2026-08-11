@@ -43,7 +43,7 @@ import (
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 	"github.com/klauspost/compress/s2"
-	"github.com/minio/highwayhash"
+	"github.com/hanzos3/highwayhash"
 	"github.com/hanzoai/pubsub/server/ats"
 	"github.com/hanzoai/pubsub/server/avl"
 	"github.com/hanzoai/pubsub/server/elastic"

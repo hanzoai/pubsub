@@ -33,7 +33,7 @@ import (
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 	"github.com/hanzoai/pubsub/internal/fastrand"
 
-	"github.com/minio/highwayhash"
+	"github.com/hanzos3/highwayhash"
 )
 
 type RaftNode interface {
