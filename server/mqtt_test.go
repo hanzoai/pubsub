@@ -2063,16 +2063,16 @@ func TestMQTTParseSub(t *testing.T) {
 		err     string
 		wantErr bool
 	}{
-		{"reserved flag", nil, 3, 0, "wrong subscribe reserved flags"},
-		{"ensure packet loaded", []byte{1, 2}, mqttSubscribeFlags, 10, io.ErrUnexpectedEOF.Error()},
-		{"error reading packet id", []byte{1}, mqttSubscribeFlags, 1, "reading packet identifier"},
-		{"packet id cannot be zero", []byte{0, 0}, mqttSubscribeFlags, 2, errMQTTPacketIdentifierIsZero.Error()},
-		{"missing filters", []byte{0, 1}, mqttSubscribeFlags, 2, "subscribe protocol must contain at least 1 topic filter"},
-		{"error reading topic", []byte{0, 1, 0, 2, 'a'}, mqttSubscribeFlags, 5, "topic filter"},
-		{"empty topic", []byte{0, 1, 0, 0}, mqttSubscribeFlags, 4, errMQTTTopicFilterCannotBeEmpty.Error()},
-		{"invalid utf8 topic", []byte{0, 1, 0, 1, 241}, mqttSubscribeFlags, 5, "invalid utf8 for topic filter"},
-		{"missing qos", []byte{0, 1, 0, 1, 'a'}, mqttSubscribeFlags, 5, "QoS"},
-		{"invalid qos", []byte{0, 1, 0, 1, 'a', 3}, mqttSubscribeFlags, 6, "subscribe QoS value must be 0, 1 or 2"},
+		{"reserved flag", nil, 3, 0, "wrong subscribe reserved flags", false},
+		{"ensure packet loaded", []byte{1, 2}, mqttSubscribeFlags, 10, io.ErrUnexpectedEOF.Error(), false},
+		{"error reading packet id", []byte{1}, mqttSubscribeFlags, 1, "reading packet identifier", false},
+		{"packet id cannot be zero", []byte{0, 0}, mqttSubscribeFlags, 2, errMQTTPacketIdentifierIsZero.Error(), false},
+		{"missing filters", []byte{0, 1}, mqttSubscribeFlags, 2, "subscribe protocol must contain at least 1 topic filter", false},
+		{"error reading topic", []byte{0, 1, 0, 2, 'a'}, mqttSubscribeFlags, 5, "topic filter", false},
+		{"empty topic", []byte{0, 1, 0, 0}, mqttSubscribeFlags, 4, errMQTTTopicFilterCannotBeEmpty.Error(), false},
+		{"invalid utf8 topic", []byte{0, 1, 0, 1, 241}, mqttSubscribeFlags, 5, "invalid utf8 for topic filter", false},
+		{"missing qos", []byte{0, 1, 0, 1, 'a'}, mqttSubscribeFlags, 5, "QoS", false},
+		{"invalid qos", []byte{0, 1, 0, 1, 'a', 3}, mqttSubscribeFlags, 6, "subscribe QoS value must be 0, 1 or 2", false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			r := &mqttReader{}
@@ -4185,14 +4185,14 @@ func TestMQTTParseUnsub(t *testing.T) {
 		err     string
 		wantErr bool
 	}{
-		{"reserved flag", nil, 3, 0, "wrong unsubscribe reserved flags"},
-		{"ensure packet loaded", []byte{1, 2}, mqttUnsubscribeFlags, 10, io.ErrUnexpectedEOF.Error()},
-		{"error reading packet id", []byte{1}, mqttUnsubscribeFlags, 1, "reading packet identifier"},
-		{"packet id cannot be zero", []byte{0, 0}, mqttUnsubscribeFlags, 2, errMQTTPacketIdentifierIsZero.Error()},
-		{"missing filters", []byte{0, 1}, mqttUnsubscribeFlags, 2, "subscribe protocol must contain at least 1 topic filter"},
-		{"error reading topic", []byte{0, 1, 0, 2, 'a'}, mqttUnsubscribeFlags, 5, "topic filter"},
-		{"empty topic", []byte{0, 1, 0, 0}, mqttUnsubscribeFlags, 4, errMQTTTopicFilterCannotBeEmpty.Error()},
-		{"invalid utf8 topic", []byte{0, 1, 0, 1, 241}, mqttUnsubscribeFlags, 5, "invalid utf8 for topic filter"},
+		{"reserved flag", nil, 3, 0, "wrong unsubscribe reserved flags", false},
+		{"ensure packet loaded", []byte{1, 2}, mqttUnsubscribeFlags, 10, io.ErrUnexpectedEOF.Error(), false},
+		{"error reading packet id", []byte{1}, mqttUnsubscribeFlags, 1, "reading packet identifier", false},
+		{"packet id cannot be zero", []byte{0, 0}, mqttUnsubscribeFlags, 2, errMQTTPacketIdentifierIsZero.Error(), false},
+		{"missing filters", []byte{0, 1}, mqttUnsubscribeFlags, 2, "subscribe protocol must contain at least 1 topic filter", false},
+		{"error reading topic", []byte{0, 1, 0, 2, 'a'}, mqttUnsubscribeFlags, 5, "topic filter", false},
+		{"empty topic", []byte{0, 1, 0, 0}, mqttUnsubscribeFlags, 4, errMQTTTopicFilterCannotBeEmpty.Error(), false},
+		{"invalid utf8 topic", []byte{0, 1, 0, 1, 241}, mqttUnsubscribeFlags, 5, "invalid utf8 for topic filter", false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			r := &mqttReader{}

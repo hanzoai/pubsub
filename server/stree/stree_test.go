@@ -1330,8 +1330,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("one.*.four.five", 11))
 		require_NoError(t, sl.Insert("one.two.three.four", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 1)
 		require_NoDuplicates(t, got)

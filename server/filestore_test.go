@@ -43,7 +43,6 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
-	"unsafe"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/hanzoai/pubsub/server/ats"

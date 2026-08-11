@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
