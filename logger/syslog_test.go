@@ -18,6 +18,7 @@ package logger
 import (
 	"fmt"
 	"log"
+	"log/syslog"
 	"net"
 	"os"
 	"path/filepath"
@@ -28,7 +29,29 @@ import (
 
 var serverFQN string
 
+// requireSyslog skips when the machine runs no syslog daemon. NewSysLogger
+// calls log.Fatalf when it cannot connect, which kills the test binary rather
+// than failing one test — a container without /dev/log took the whole package
+// down with it:
+//
+//	error connecting to syslog: "Unix syslog delivery error"
+//	FAIL	github.com/hanzoai/pubsub/logger	0.006s
+//
+// The remote tests below need no daemon; they dial a listener they start
+// themselves, so only the two local ones are guarded.
+func requireSyslog(t *testing.T) {
+	t.Helper()
+
+	w, err := syslog.New(syslog.LOG_DAEMON|syslog.LOG_NOTICE, GetSysLoggerTag())
+	if err != nil {
+		t.Skipf("no local syslog daemon: %v", err)
+	}
+	w.Close() //nolint:errcheck // probe only
+}
+
 func TestSysLogger(t *testing.T) {
+	requireSyslog(t)
+
 	logger := NewSysLogger(false, false)
 
 	if logger.debug {
@@ -41,6 +64,8 @@ func TestSysLogger(t *testing.T) {
 }
 
 func TestSysLoggerWithDebugAndTrace(t *testing.T) {
+	requireSyslog(t)
+
 	logger := NewSysLogger(true, true)
 
 	if !logger.debug {
