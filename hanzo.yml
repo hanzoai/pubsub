@@ -1,10 +1,6 @@
 # Canonical CI/CD config for hanzoai/pubsub — the one file both the hanzoai/ci
 # reusable (.hanzo/workflows/cicd.yml) and platform.hanzo.ai read.
 #
-# GATE ONLY: the image already has a lane (.github/workflows/deploy.yml →
-# hanzoai/.github docker-build → ghcr.io/hanzoai/pubsub), so nothing here needs
-# to build it a second time.
-#
 # The gate compiles and vets EVERYTHING, then runs the suites that need no
 # cluster: config parsing, the internal packages, the logger, and the embedded
 # server. That split is the point. ./server holds 87 test files that stand up
@@ -15,6 +11,17 @@
 #
 # `go vet ./...` is unscoped on purpose: it is cheap, it reads the server tree
 # too, and it is the part of the whole-repo check that does not need a cluster.
+
+images:
+  # ghcr.io/hanzoai/pubsub was built by a reusable in hanzoai/.github called from
+  # .github/workflows/deploy.yml. github.com is no longer where this repo's
+  # pipeline lives, so the image is declared here and built by the same lane
+  # that gates it — one build, one place.
+  - name: pubsub
+    context: .
+    dockerfile: Dockerfile
+    repo: ghcr.io/hanzoai/pubsub
+
 test:
   - name: build
     run: |

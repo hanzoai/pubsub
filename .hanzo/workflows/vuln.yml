@@ -1,0 +1,31 @@
+# govulncheck against the module's own Go version.
+#
+# Separate from the gate on purpose: a vulnerability lands in a dependency
+# without anyone touching this repo, so this runs daily as well as on change.
+# The gate answers "did this commit break the build"; this answers "is what we
+# already shipped still safe".
+name: Vulnerabilities
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  govulncheck:
+    runs-on: hanzo-build-linux-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: govulncheck
+        run: |
+          set -e
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
