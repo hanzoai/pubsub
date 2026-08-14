@@ -12,6 +12,10 @@ dist
 *.conf
 *.cfg
 
+# The image's default config is source, not a local scratch file. Without this
+# the glob above drops it and the Dockerfile's COPY of it fails the build.
+!docker/nats-server.conf
+
 # Architecture specific extensions/prefixes
 *.[568vq]
 [568vq].out
