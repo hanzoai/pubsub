@@ -59,7 +59,6 @@ coverage.out
 pkg
 
 # AI assistant config
-CLAUDE.md
 AGENTS.md
 GEMINI.md
 QWEN.md
