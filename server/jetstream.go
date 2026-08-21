@@ -30,7 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/minio/highwayhash"
+	"github.com/hanzos3/highwayhash"
 	"github.com/hanzoai/pubsub/server/gsl"
 	"github.com/hanzoai/pubsub/server/sysmem"
 	"github.com/hanzoai/pubsub/server/tpm"
