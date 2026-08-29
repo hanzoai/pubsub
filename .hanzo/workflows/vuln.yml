@@ -15,7 +15,7 @@ on:
 
 jobs:
   govulncheck:
-    runs-on: hanzo-build-linux-amd64
+    runs-on: [hanzo-build-linux-amd64]
     steps:
       - uses: actions/checkout@v4
 
