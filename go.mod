@@ -8,7 +8,7 @@ require (
 	github.com/hanzoai/pubsub-go v1.53.0
 	github.com/klauspost/compress v1.18.6
 	github.com/luxfi/age v1.6.0
-	github.com/luxfi/consensus v1.36.2
+	github.com/luxfi/consensus v1.36.81
 	github.com/luxfi/zap v1.2.6
 	github.com/luxfi/zapdb v1.10.6
 	github.com/nats-io/jwt/v2 v2.8.1
