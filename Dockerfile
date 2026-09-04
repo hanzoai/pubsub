@@ -31,17 +31,26 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -ldflags "-w -X server.serverVersion=${VERSION} -X server.gitCommit=${GIT_COMMIT}" \
     -o /out/pubsub .
 
-FROM --platform=$TARGETPLATFORM alpine:latest
+FROM alpine:3.22 AS root
+RUN apk add --no-cache ca-certificates tzdata && \
+    mkdir -p /pubsub/conf /data && \
+    chown -R 65532:65532 /pubsub /data
+
+FROM scratch
 
 LABEL org.opencontainers.image.title="Hanzo PubSub"
 LABEL org.opencontainers.image.description="NATS-compatible pub/sub messaging — Hanzo PubSub"
 LABEL org.opencontainers.image.vendor="Hanzo AI"
 LABEL org.opencontainers.image.source="https://github.com/hanzoai/pubsub"
 
+COPY --from=root /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=root /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=root --chown=65532:65532 /data /data
+COPY --from=root --chown=65532:65532 /pubsub /pubsub
 COPY docker/nats-server.conf                  /pubsub/conf/server.conf
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /out/pubsub               /bin/pubsub
 
+USER 65532:65532
 EXPOSE 4222 8222 6222 5222
 
 ENTRYPOINT ["/bin/pubsub"]
