@@ -25,6 +25,7 @@ package embed
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/hanzoai/pubsub/server"
@@ -71,6 +72,27 @@ type Options struct {
 	// Debug and Trace raise the core server's log verbosity.
 	Debug bool
 	Trace bool
+
+	// Auth decides every client connection: whether it is admitted, which
+	// account it lands in, and what it may publish and subscribe to — through
+	// ClientAuthentication.RegisterUser. Nil admits every client to the global
+	// account with no limit, which is the server a host gets when it says
+	// nothing.
+	Auth server.Authentication
+
+	// Accounts are named accounts the server runs beside the global one, each
+	// with JetStream enabled. An account is a separate subject space AND a
+	// separate JetStream: nothing a client does in one — a publish, a stream, a
+	// stream that republishes or sources — reaches another, which is the one
+	// isolation NATS enforces without trusting a permission list. A client
+	// reaches an account only by Auth placing it there.
+	//
+	// The global account keeps JetStream and every stream it already stored.
+	// Naming accounts is what takes that away in NATS — a server with accounts
+	// configured enables JetStream only where an account asks, and the global
+	// account cannot ask in configuration — so Open enables it itself, and no
+	// client is admitted until it has.
+	Accounts []string
 }
 
 // Server is a running embedded PubSub instance.
@@ -118,6 +140,20 @@ func Open(o Options) (*Server, error) {
 		NoSigs:     true, // the host owns process signals
 		Debug:      o.Debug,
 		Trace:      o.Trace,
+
+		CustomClientAuthentication: o.Auth,
+	}
+	var gate *opening
+	if len(o.Accounts) > 0 {
+		conf, err := accounts(o.Accounts)
+		if err != nil {
+			return nil, err
+		}
+		if err := opts.ProcessConfigString(conf); err != nil {
+			return nil, fmt.Errorf("embed: accounts: %w", err)
+		}
+		gate = &opening{inner: o.Auth, open: make(chan struct{})}
+		opts.CustomClientAuthentication = gate
 	}
 
 	ns, err := server.NewServer(opts)
@@ -132,8 +168,73 @@ func Open(o Options) (*Server, error) {
 		ns.Shutdown()
 		return nil, fmt.Errorf("embed: nats not ready within %s", readyTimeout)
 	}
+	if gate != nil {
+		if err := ns.GlobalAccount().EnableJetStream(nil, nil); err != nil {
+			ns.Shutdown()
+			return nil, fmt.Errorf("embed: jetstream on the global account: %w", err)
+		}
+		close(gate.open)
+	}
 
 	return &Server{ns: ns}, nil
+}
+
+// accounts renders names as the server's own account configuration, each with
+// JetStream enabled — the one public way to enable it on an account before the
+// server starts.
+//
+// A name must be a plain token: it is written into that language, and the
+// reserved names ($G, $SYS) are not tokens, so no host can take one.
+func accounts(names []string) (string, error) {
+	var b strings.Builder
+	b.WriteString("accounts {\n")
+	seen := map[string]bool{}
+	for _, name := range names {
+		if !token(name) || seen[name] {
+			return "", fmt.Errorf("embed: account %q is not a distinct plain name", name)
+		}
+		seen[name] = true
+		b.WriteString("  " + name + ": { jetstream: enabled }\n")
+	}
+	b.WriteString("}\n")
+	return b.String(), nil
+}
+
+// token reports whether s is letters, digits, '-' and '_' only.
+func token(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// opening holds every client until the global account has JetStream again, then
+// hands the decision to the host's authenticator. Without it a client that dialed
+// in the moment between the accept loop starting and JetStream being enabled
+// would find every global stream missing — and a client that creates a stream
+// it cannot find would create an empty one.
+type opening struct {
+	inner server.Authentication
+	open  chan struct{}
+}
+
+func (g *opening) Check(c server.ClientAuthentication) bool {
+	select {
+	case <-g.open:
+	case <-time.After(readyTimeout):
+		return false
+	}
+	if g.inner == nil {
+		return true
+	}
+	return g.inner.Check(c)
 }
 
 // ClientURL is the NATS URL clients dial (e.g. nats://0.0.0.0:4222). In-process
