@@ -98,6 +98,23 @@ go test ./internal/... -v
 PUBSUB_QUASAR_ENABLED=true ./pubsub   # with Quasar consensus
 ```
 
+## Embedding (`embed/`)
+`embed.Open(Options)` runs core NATS + JetStream in process for a host binary (hanzoai/cloud).
+- **Cluster**: `Options.Cluster{Name, Port, Routes, User, Password}` joins the node to its peers.
+  JetStream replicates through NATS raft: one meta group of every member, one group per stream.
+  R3 is that raft. Routes are refused without credentials, and list every member, this one too:
+  the first election's size is the number of routes.
+- **Identity**: the server name is `<ServerName>.<generation>`. The generation is a random id
+  persisted in `StoreDir/generation` at first boot (`Options.Generation` fixes it for a store with
+  none). A store that survives keeps its raft name and log together; an empty store is a new member,
+  never an old name without its log.
+- **Retire**: once current, a node removes offline older generations of its own name from the meta
+  group (`$JS.API.SERVER.REMOVE`, over an in-process system-account client).
+- **Ready(ctx)**: `Healthz` ok and `JetStreamIsCurrent`. **Shutdown** is lame duck.
+- **Limits**: `MaxStore`, `MaxMemory` bound JetStream; zero leaves NATS's own.
+- Tests: `go test -race ./embed/...` runs three in-process servers (restart empty, two emptied at
+  once, all lost, route auth).
+
 ## Key Packages
 - `internal/consensus/` — Quasar consensus + ZAP P2P (7 tests)
 - `internal/store/` — zapdb + PQ-safe age backup/restore (9 tests)
