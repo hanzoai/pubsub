@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -28,11 +29,16 @@ import (
 // the server's own raft: one group of every member that orders the streams and
 // consumers, and one group per stream that orders its messages, each electing a
 // leader by majority vote and committing by majority acknowledgement.
+//
+// Each member needs its own Options.ServerName, which no other member shares: a
+// member takes every other generation of its name for an older one of itself,
+// and removes it once it is offline.
 type Cluster struct {
 	// Name is the cluster's name. Every member names the same one.
 	Name string
 	// Port is the route port (default 6222). Use -1 for a random free port
-	// (tests).
+	// (tests). A port that is already bound is refused by Open; left to the
+	// server it stops the host's process.
 	Port int
 	// Routes are the members this one dials, as host:port or
 	// nats-route://host:port. List every member, this one too: the size of the
@@ -64,8 +70,18 @@ func (c Cluster) apply(opts *server.Options) error {
 	if len(c.Routes) == 0 {
 		return fmt.Errorf("embed: cluster needs routes")
 	}
+	port := intOr(c.Port, 6222)
+	if port > 0 {
+		// The server calls Fatalf when it cannot listen on its route port, which
+		// ends the host's process: say so here instead.
+		l, err := net.Listen("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
+		if err != nil {
+			return fmt.Errorf("embed: cluster route port %d: %w", port, err)
+		}
+		l.Close()
+	}
 	opts.Cluster.Name = c.Name
-	opts.Cluster.Port = intOr(c.Port, 6222)
+	opts.Cluster.Port = port
 	opts.Cluster.Username = c.User
 	opts.Cluster.Password = c.Password
 	for _, r := range c.Routes {
@@ -129,8 +145,13 @@ func (e *entry) Check(c server.ClientAuthentication) bool {
 }
 
 // retirePoll is how often a new generation looks again for the older ones it
-// has yet to remove.
+// has yet to remove, or to retry after a failure.
 const retirePoll = 2 * time.Second
+
+// settle is how long a new generation lets the other members hear its report
+// before it removes the ones it replaced. The server sends a report at most once
+// a second.
+const settle = 2 * time.Second
 
 // members is the part of the meta leader's answer to a JSZ request that names
 // the members of the cluster.
@@ -149,7 +170,8 @@ type reply struct {
 }
 
 // retire removes the older generations of this server from the cluster, once
-// this one is current.
+// this one is current, and then says so by closing s.retired, which is what
+// Ready waits for.
 //
 // A server that comes back with an empty store comes back as a new peer, and
 // the peer it was before stays in every raft group as a member that never
@@ -157,46 +179,120 @@ type reply struct {
 // read. JetStream drops it only when told to, so this tells it: any peer named
 // <name>.<other generation> that is offline is a generation this one
 // replaced, since a name is held by one process at a time. A peer of that
-// name still online is left alone, and so is every peer of another name,
-// which may only be restarting.
+// name still online is waited for, and a peer of another name is left alone,
+// since it may only be restarting.
 //
-// It returns when no older generation is left, or when ctx is done.
+// It waits on the node being current, not on Ready, since Ready waits on it.
+// A failure is logged once and tried again, for as long as ctx lasts: until
+// the older generations are gone this node is not ready.
 func (s *Server) retire(ctx context.Context) {
 	defer close(s.done)
-	if err := s.Ready(ctx); err != nil {
-		return
-	}
-	nc, err := nats.Connect("", nats.InProcessServer(s.ns), nats.Token(s.secret), nats.NoReconnect())
-	if err != nil {
-		s.ns.Warnf("embed: generations: %v", err)
-		return
-	}
-	defer nc.Close()
-
+	defer func() {
+		if s.conn != nil {
+			s.conn.Close()
+		}
+	}()
 	base, _ := split(s.ns.Name())
+	var said string
 	for {
-		gone, err := stale(ctx, nc, s.ns.Name(), base)
-		if err != nil {
-			s.ns.Debugf("embed: generations: %v", err)
-		}
-		if err == nil && len(gone) == 0 {
-			return
-		}
-		for _, p := range gone {
-			if !p.Offline {
-				continue
+		wait := readyPoll
+		if s.current() == "" {
+			removed, left, err := s.sweep(ctx, base)
+			switch {
+			case ctx.Err() != nil:
+				return
+			case err != nil:
+				if err.Error() != said {
+					said = err.Error()
+					s.ns.Warnf("embed: generations: %v", err)
+				}
+				wait = retirePoll
+			case removed > 0:
+				said = ""
+			case len(left) == 0:
+				close(s.retired)
+				return
+			default:
+				if msg := fmt.Sprintf("waiting for %s to go offline", strings.Join(left, ", ")); msg != said {
+					said = msg
+					s.ns.Noticef("embed: generations: %s", msg)
+				}
+				wait = retirePoll
 			}
-			if err := remove(ctx, nc, p); err != nil {
-				s.ns.Warnf("embed: removing generation %s: %v", p.Name, err)
-				continue
-			}
-			s.ns.Noticef("embed: removed generation %s", p.Name)
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(retirePoll):
+		case <-time.After(wait):
 		}
+	}
+}
+
+// dial returns the system-account client retire speaks through, connecting it
+// again when it has closed.
+func (s *Server) dial() (*nats.Conn, error) {
+	if s.conn != nil && !s.conn.IsClosed() {
+		return s.conn, nil
+	}
+	nc, err := nats.Connect("", nats.InProcessServer(s.ns), nats.Token(s.secret), nats.NoReconnect())
+	if err != nil {
+		return nil, fmt.Errorf("connecting: %w", err)
+	}
+	s.conn = nc
+	return nc, nil
+}
+
+// sweep asks the meta leader for the other generations of base and removes the
+// offline ones. It reports how many it removed and the names of those it left,
+// which are online.
+func (s *Server) sweep(ctx context.Context, base string) (removed int, left []string, err error) {
+	nc, err := s.dial()
+	if err != nil {
+		return 0, nil, err
+	}
+	gone, err := stale(ctx, nc, s.ns.Name(), base)
+	if err != nil {
+		return 0, nil, err
+	}
+	for _, p := range gone {
+		if p.Offline {
+			if err := hear(ctx, nc); err != nil {
+				return 0, nil, err
+			}
+			break
+		}
+	}
+	for _, p := range gone {
+		if !p.Offline {
+			left = append(left, p.Name)
+			continue
+		}
+		if err := remove(ctx, nc, p); err != nil {
+			return removed, left, fmt.Errorf("removing generation %s: %w", p.Name, err)
+		}
+		s.ns.Noticef("embed: removed generation %s", p.Name)
+		removed++
+	}
+	return removed, left, nil
+}
+
+// hear has every member report to the others, and waits for the reports to land.
+//
+// The meta leader replaces a removed member with one it has heard a JetStream
+// report from since its route last registered, and a route that registers again
+// forgets it. The next report on its own can be seconds away, so a removal made
+// the moment a member is current can find nothing to replace the old one with:
+// its streams then stay a replica short for good, and the next member restarted
+// takes the cluster below a majority.
+func hear(ctx context.Context, nc *nats.Conn) error {
+	if err := nc.Publish("$SYS.REQ.SERVER.PING.STATSZ", nil); err != nil {
+		return fmt.Errorf("asking for reports: %w", err)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(settle):
+		return nil
 	}
 }
 

@@ -99,21 +99,34 @@ PUBSUB_QUASAR_ENABLED=true ./pubsub   # with Quasar consensus
 ```
 
 ## Embedding (`embed/`)
-`embed.Open(Options)` runs core NATS + JetStream in process for a host binary (hanzoai/cloud).
+`embed.Open(Options)` runs Hanzo pubsub in process for a host binary (hanzoai/cloud).
 - **Cluster**: `Options.Cluster{Name, Port, Routes, User, Password}` joins the node to its peers.
-  JetStream replicates through NATS raft: one meta group of every member, one group per stream.
-  R3 is that raft. Routes are refused without credentials, and list every member, this one too:
-  the first election's size is the number of routes.
+  JetStream replicates through the server's own raft: one meta group of every member, one group per
+  stream. R3 is that raft. Routes are refused without credentials, and list every member, this one
+  too: the first election's size is the number of routes. A route port that is already bound is
+  refused by `Open`; left to the server it would end the host's process.
 - **Identity**: the server name is `<ServerName>.<generation>`. The generation is a random id
   persisted in `StoreDir/generation` at first boot (`Options.Generation` fixes it for a store with
   none). A store that survives keeps its raft name and log together; an empty store is a new member,
-  never an old name without its log.
+  never an old name without its log. `ServerName` is required in a cluster and is the member's own,
+  a pod name: members that share one take each other for older generations of themselves. `Open`
+  validates the options before it writes the generation, so a refused `Open` leaves `StoreDir` as
+  it was.
 - **Retire**: once current, a node removes offline older generations of its own name from the meta
-  group (`$JS.API.SERVER.REMOVE`, over an in-process system-account client).
-- **Ready(ctx)**: `Healthz` ok and `JetStreamIsCurrent`. **Shutdown** is lame duck.
-- **Limits**: `MaxStore`, `MaxMemory` bound JetStream; zero leaves NATS's own.
-- Tests: `go test -race ./embed/...` runs three in-process servers (restart empty, two emptied at
-  once, all lost, route auth).
+  group (`$JS.API.SERVER.REMOVE`, over an in-process system-account client, dialed again if it
+  closes). It waits on health and `JetStreamIsCurrent`, not on `Ready`, which waits on it. A failure
+  is logged once per distinct message and retried. Before it removes, it has every member report
+  (`$SYS.REQ.SERVER.PING.STATSZ`, no reply) and waits `settle`: the meta leader replaces a removed
+  member only with one whose JetStream report it has heard since the route last registered, and
+  without a replacement the stream stays a replica short.
+- **Ready(ctx)**: `Healthz` ok, `JetStreamIsCurrent`, and the older generations removed. The last
+  makes it safe to pace a rolling restart by `Ready`: a member that came back empty is current long
+  before its old generation is gone, and until then that generation counts toward every majority.
+  **Shutdown** is lame duck, and takes at least `lameDuckGrace` (1 s) when a client is connected.
+- **Limits**: `MaxStore`, `MaxMemory` bound JetStream; zero leaves the server's own.
+- Tests: `go test -race ./embed/...` runs three in-process servers (restart empty, also as a
+  separate account behind the host's `Auth`; every member emptied in turn gated on `Ready` alone;
+  two emptied at once; all lost; route auth and refused options).
 
 ## Key Packages
 - `internal/consensus/` — Quasar consensus + ZAP P2P (7 tests)

@@ -35,6 +35,9 @@ type ring struct {
 	client [3]int
 	route  [3]int
 	srv    [3]*Server
+	// account, when set, runs the bus as that account with a host
+	// authenticator placing clients in it, as the host that embeds this does.
+	account string
 }
 
 func newRing(t *testing.T) *ring {
@@ -90,15 +93,25 @@ func (r *ring) urls() string {
 // them, as a StatefulSet's pods do.
 func (r *ring) open(i int, dir string) {
 	r.t.Helper()
-	s, err := Open(Options{
+	o := Options{
 		Host:       "127.0.0.1",
 		Port:       r.client[i],
 		ServerName: r.name[i],
 		StoreDir:   dir,
 		Cluster:    Cluster{Name: "ring", Port: r.route[i], Routes: r.routes(), User: user, Password: password},
-	})
+	}
+	var auth *planeAuth
+	if r.account != "" {
+		auth = &planeAuth{}
+		o.Auth = auth
+		o.Accounts = []string{r.account}
+	}
+	s, err := Open(o)
 	if err != nil {
 		r.t.Fatalf("open %s: %v", r.name[i], err)
+	}
+	if auth != nil {
+		auth.srv.Store(s)
 	}
 	r.srv[i] = s
 }
@@ -143,7 +156,11 @@ func eventually(t *testing.T, within time.Duration, what string, f func() error)
 
 func (r *ring) dial() (*nats.Conn, jetstream.JetStream) {
 	r.t.Helper()
-	nc, err := nats.Connect(r.urls(), nats.MaxReconnects(-1), nats.ReconnectWait(100*time.Millisecond), nats.RetryOnFailedConnect(true))
+	opts := []nats.Option{nats.MaxReconnects(-1), nats.ReconnectWait(100 * time.Millisecond), nats.RetryOnFailedConnect(true)}
+	if r.account != "" {
+		opts = append(opts, nats.UserInfo(r.account, ""))
+	}
+	nc, err := nats.Connect(r.urls(), opts...)
 	if err != nil {
 		r.t.Fatalf("connect: %v", err)
 	}
@@ -371,7 +388,7 @@ func (r *ring) members() ([]string, error) {
 	return nil, errors.New("no meta leader")
 }
 
-// gone waits until the meta group no longer holds the named member.
+// forgotten waits until the meta group no longer holds the named member.
 func (r *ring) forgotten(within time.Duration, name string) {
 	r.t.Helper()
 	eventually(r.t, within, name+" removed", func() error {
@@ -391,11 +408,36 @@ func (r *ring) forgotten(within time.Duration, name string) {
 	})
 }
 
+// absent fails the test when the meta group holds the named member now. Unlike
+// forgotten it does not wait for the member to leave: it asks what Ready
+// promised.
+func (r *ring) absent(name string) {
+	r.t.Helper()
+	var names []string
+	eventually(r.t, 10*time.Second, "meta group", func() (err error) {
+		names, err = r.members()
+		return err
+	})
+	for _, n := range names {
+		if n == name {
+			r.t.Fatalf("a member is ready while the meta group still holds %s among %v", name, names)
+		}
+	}
+}
+
 // One server restarted with an empty store catches up under a new name, the old
 // one is removed, R3 is whole again, and nothing the cluster acknowledged on the
 // way is lost.
-func TestRestartedEmptyCatchesUp(t *testing.T) {
+func TestRestartedEmptyCatchesUp(t *testing.T) { restartEmpty(t, "") }
+
+// The same when the bus runs as a separate account behind the host's
+// authenticator, as it does in the host that embeds it: the account's JetStream
+// is the one that must be repaired.
+func TestRestartedEmptyInAnAccount(t *testing.T) { restartEmpty(t, "event") }
+
+func restartEmpty(t *testing.T, account string) {
 	r := newRing(t)
+	r.account = account
 	for i := range r.srv {
 		r.open(i, t.TempDir())
 	}
@@ -420,9 +462,53 @@ func TestRestartedEmptyCatchesUp(t *testing.T) {
 		t.Fatalf("restarted as %q after %q", renamed, old)
 	}
 	r.ready(120*time.Second, 0, 1, 2)
-	r.forgotten(60*time.Second, old)
+	r.absent(old)
 	r.whole(90*time.Second, st, old)
 
+	acked := w.finish()
+	r.converged(60*time.Second, st)
+	kept(t, st, acked)
+	if len(acked) <= 100 {
+		t.Fatalf("only %d records acknowledged", len(acked))
+	}
+}
+
+// A rolling restart that waits for each member's Ready and for nothing else
+// loses nothing, however fast it goes. Every member is emptied in turn, the next
+// the moment the one before is ready. A member that were ready while its older
+// generation still sat in the cluster would leave that generation counting
+// toward every majority, and the next restart would take the cluster below one.
+func TestRollingRestartLosesNothing(t *testing.T) {
+	r := newRing(t)
+	for i := range r.srv {
+		r.open(i, t.TempDir())
+	}
+	r.ready(90*time.Second, 0, 1, 2)
+	js, st := r.log()
+	w := r.write(js)
+	eventually(t, 30*time.Second, "records", func() error {
+		if w.count() < 100 {
+			return fmt.Errorf("%d acknowledged", w.count())
+		}
+		return nil
+	})
+	r.converged(30*time.Second, st)
+
+	var gone []string
+	for _, i := range []int{2, 1, 0} {
+		old := r.srv[i].NATS().Name()
+		gone = append(gone, old)
+		r.down(i)
+		r.open(i, t.TempDir())
+		r.ready(120*time.Second, i)
+		r.absent(old)
+	}
+
+	r.ready(120*time.Second, 0, 1, 2)
+	for _, name := range gone {
+		r.forgotten(60*time.Second, name)
+	}
+	r.whole(120*time.Second, st, gone...)
 	acked := w.finish()
 	r.converged(60*time.Second, st)
 	kept(t, st, acked)
@@ -558,6 +644,16 @@ func TestAllLostFormsAFreshCluster(t *testing.T) {
 	}
 }
 
+// The generation file is the store's identity, so a refused Open must not have
+// written one, or a store would be pinned to a generation by a host that never
+// started.
+func untouched(t *testing.T, what, dir string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(dir, generation)); err == nil {
+		t.Errorf("%s: a refused Open left a generation in the store", what)
+	}
+}
+
 // A cluster port that does not ask who is dialling admits a member that votes,
 // so a cluster with no credentials is refused, and so is a route that arrives
 // without them.
@@ -572,16 +668,18 @@ func TestRoutesWithoutCredentialsAreRefused(t *testing.T) {
 		"no port":     {Name: "ring", Port: -1, User: user, Password: password, Routes: []string{"127.0.0.1"}},
 		"scheme":      {Name: "ring", Port: -1, User: user, Password: password, Routes: []string{"http://127.0.0.1:6222"}},
 	} {
-		s, err := Open(Options{Port: -1, StoreDir: t.TempDir(), Cluster: c})
+		dir := t.TempDir()
+		s, err := Open(Options{Port: -1, ServerName: "member", StoreDir: dir, Generation: "pinned", Cluster: c})
 		if err == nil {
 			s.Shutdown()
 			t.Errorf("%s: opened", name)
 		}
+		untouched(t, name, dir)
 	}
 
 	// The route it dials is never there; the one that matters is the one it
 	// listens on.
-	s, err := Open(Options{Host: "127.0.0.1", Port: -1, StoreDir: t.TempDir(), Cluster: Cluster{Name: "ring", Port: -1, Routes: []string{"127.0.0.1:1"}, User: user, Password: password}})
+	s, err := Open(Options{Host: "127.0.0.1", Port: -1, ServerName: "member", StoreDir: t.TempDir(), Cluster: Cluster{Name: "ring", Port: -1, Routes: []string{"127.0.0.1:1"}, User: user, Password: password}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,6 +712,81 @@ func TestRoutesWithoutCredentialsAreRefused(t *testing.T) {
 	if line := dial(right); strings.HasPrefix(line, "-ERR") {
 		t.Errorf("route with credentials answered %q", line)
 	}
+}
+
+// A member is its name: with none given a cluster would run every member as
+// the same default, each taking the others for older generations of itself.
+func TestAClusterNeedsAServerName(t *testing.T) {
+	dir := t.TempDir()
+	c := Cluster{Name: "ring", Port: -1, Routes: []string{"127.0.0.1:6222"}, User: user, Password: password}
+	if s, err := Open(Options{Port: -1, StoreDir: dir, Generation: "pinned", Cluster: c}); err == nil {
+		s.Shutdown()
+		t.Fatal("a clustered server opened without a name")
+	} else if !strings.Contains(err.Error(), "ServerName") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+	untouched(t, "no name", dir)
+
+	// A node alone keeps its default.
+	s, err := Open(Options{Port: -1, StoreDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Shutdown()
+	if got := s.NATS().Name(); !strings.HasPrefix(got, "pubsub-embedded.") {
+		t.Fatalf("a node alone is named %q", got)
+	}
+}
+
+// The client retire speaks through is dialed again when it has closed, so one
+// failed connection does not leave the older generations in the cluster for the
+// life of the process.
+func TestRetireDialsAgain(t *testing.T) {
+	// Two members that are never there: this one cannot form a majority alone,
+	// so it is never current and retire leaves the client to the test.
+	c := Cluster{Name: "ring", Port: -1, Routes: []string{"127.0.0.1:1", "127.0.0.1:2"}, User: user, Password: password}
+	s, err := Open(Options{Host: "127.0.0.1", Port: -1, ServerName: "member", StoreDir: t.TempDir(), Cluster: c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Shutdown()
+
+	first, err := s.dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, err := s.dial(); err != nil || again != first {
+		t.Fatalf("an open client was replaced: %v", err)
+	}
+	first.Close()
+	second, err := s.dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first || second.IsClosed() {
+		t.Fatal("a closed client was handed out again")
+	}
+}
+
+// A route port that is taken is an error from Open: the server's own answer is
+// to stop the process, which would be the host's.
+func TestARouteThatCannotBeHeldIsRefused(t *testing.T) {
+	busy, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	port := busy.Addr().(*net.TCPAddr).Port
+
+	dir := t.TempDir()
+	c := Cluster{Name: "ring", Port: port, Routes: []string{fmt.Sprintf("127.0.0.1:%d", port)}, User: user, Password: password}
+	if s, err := Open(Options{Host: "127.0.0.1", Port: -1, ServerName: "member", StoreDir: dir, Generation: "pinned", Cluster: c}); err == nil {
+		s.Shutdown()
+		t.Fatal("opened on a route port that is taken")
+	} else if !strings.Contains(err.Error(), fmt.Sprint(port)) {
+		t.Fatalf("the error does not name the port: %v", err)
+	}
+	untouched(t, "busy route port", dir)
 }
 
 // A store keeps the generation it was first booted with, and a new store gets a

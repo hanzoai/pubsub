@@ -16,10 +16,10 @@
 //
 // Coordination model. Without Options.Cluster a single embedded node runs
 // JetStream over its local file store and nothing replicates. With it the node
-// routes to its peers and JetStream replicates through NATS's own raft: one
-// group of every member that orders streams and consumers, and one group per
-// stream that orders its messages. R3 is that raft, with three members; there
-// is no ZooKeeper or etcd in the path. The optional Quasar PQ consensus (Lux)
+// routes to its peers and JetStream replicates through the server's own raft:
+// one group of every member that orders streams and consumers, and one group
+// per stream that orders its messages. R3 is that raft, with three members;
+// there is no ZooKeeper or etcd in the path. The optional Quasar PQ consensus (Lux)
 // + zapdb control plane that package main can enable is intentionally NOT part
 // of this surface: it is unused in the production deployment and its adapter
 // (internal/consensus) is pinned to the legacy luxfi/consensus v1.22 API,
@@ -35,10 +35,12 @@
 // had, and an empty one starts under a new name, as a new member. Once it is
 // current that member removes the older generations of its name from the
 // cluster, which are offline and would otherwise count toward every majority
-// for good.
+// for good. ServerName is therefore the member's own and no other's, a pod
+// name, and a clustered server has none by default.
 //
 // Lifecycle. Open returns once the server accepts connections, not once the
-// cluster has formed; Ready says when it has. Shutdown is lame duck.
+// cluster has formed; Ready says when it has, which is when the generations it
+// replaced are gone as well. Shutdown is lame duck.
 package embed
 
 import (
@@ -46,6 +48,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	nats "github.com/hanzoai/pubsub-go"
 
 	"github.com/hanzoai/pubsub/server"
 )
@@ -73,8 +77,10 @@ type Options struct {
 	// Port is the NATS client port (default 4222). Use -1 for a random free
 	// port (tests).
 	Port int
-	// ServerName identifies this node (default "pubsub-embedded"). The server
-	// runs as <ServerName>.<generation>.
+	// ServerName identifies this node (default "pubsub-embedded" for a node
+	// alone). The server runs as <ServerName>.<generation>. In a cluster it is
+	// required and must differ for every member, a pod name: members that share
+	// one take each other for older generations of themselves.
 	ServerName string
 	// StoreDir is the JetStream file-storage root. Required — JetStream is
 	// always on in an embedded server.
@@ -85,7 +91,7 @@ type Options struct {
 	// another is refused, since its log is another member's.
 	Generation string
 	// MaxStore and MaxMemory bound JetStream's file and memory storage, in
-	// bytes. Zero leaves NATS's own limit: three quarters of the memory the
+	// bytes. Zero leaves the server's own limit: three quarters of the memory the
 	// host reports and of the disk that is free. A node on a volume smaller
 	// than the disk it reads must say how much it may fill.
 	MaxStore  int64
@@ -130,10 +136,12 @@ type Options struct {
 
 // Server is a running embedded PubSub instance.
 type Server struct {
-	ns     *server.Server
-	secret string             // the credential of the system-account client retire dials with
-	stop   context.CancelFunc // ends retire
-	done   chan struct{}      // closed when retire has returned and its client is closed
+	ns      *server.Server
+	secret  string             // the credential of the system-account client retire dials with
+	conn    *nats.Conn         // that client, dialed when retire needs one; retire's alone
+	stop    context.CancelFunc // ends retire
+	done    chan struct{}      // closed when retire has returned and its client is closed
+	retired chan struct{}      // closed when no older generation of this server is left in the cluster
 }
 
 // lameDuckGrace and lameDuckSpan are how long Shutdown keeps clients connected
@@ -174,15 +182,14 @@ func Open(o Options) (*Server, error) {
 	if o.StoreDir == "" {
 		return nil, fmt.Errorf("embed: StoreDir required")
 	}
-	gen, err := incarnation(o.StoreDir, o.Generation)
-	if err != nil {
-		return nil, err
+	clustered := o.Cluster.enabled()
+	if clustered && o.ServerName == "" {
+		return nil, fmt.Errorf("embed: a clustered server needs a ServerName, distinct for each member")
 	}
 
 	opts := &server.Options{
 		Host:       strOr(o.Host, "0.0.0.0"),
 		Port:       intOr(o.Port, 4222),
-		ServerName: strOr(o.ServerName, "pubsub-embedded") + "." + gen,
 		JetStream:  true,
 		StoreDir:   o.StoreDir,
 		MaxPayload: int32Or(o.MaxPayload, DefaultMaxPayload),
@@ -198,7 +205,7 @@ func Open(o Options) (*Server, error) {
 		CustomClientAuthentication: o.Auth,
 	}
 	var gate *entry
-	if o.Cluster.enabled() {
+	if clustered {
 		if err := o.Cluster.apply(opts); err != nil {
 			return nil, err
 		}
@@ -217,8 +224,9 @@ func Open(o Options) (*Server, error) {
 		}
 		gate.open = make(chan struct{})
 	}
-	s := &Server{done: make(chan struct{})}
-	if o.Cluster.enabled() {
+	s := &Server{done: make(chan struct{}), retired: make(chan struct{})}
+	if clustered {
+		var err error
 		if s.secret, err = secret(); err != nil {
 			return nil, fmt.Errorf("embed: %w", err)
 		}
@@ -227,6 +235,14 @@ func Open(o Options) (*Server, error) {
 	if gate != nil {
 		opts.CustomClientAuthentication = gate
 	}
+
+	// Last, so that a refused Open leaves nothing in StoreDir: the generation
+	// it writes there is the identity the store's log will carry.
+	gen, err := incarnation(o.StoreDir, o.Generation)
+	if err != nil {
+		return nil, err
+	}
+	opts.ServerName = strOr(o.ServerName, "pubsub-embedded") + "." + gen
 
 	ns, err := server.NewServer(opts)
 	if err != nil {
@@ -254,9 +270,10 @@ func Open(o Options) (*Server, error) {
 
 	ctx, stop := context.WithCancel(context.Background())
 	s.stop = stop
-	if o.Cluster.enabled() {
+	if clustered {
 		go s.retire(ctx)
 	} else {
+		close(s.retired)
 		close(s.done)
 	}
 	return s, nil
@@ -308,8 +325,15 @@ func (s *Server) NATS() *server.Server { return s.ns }
 
 // Ready blocks until the node can serve: its health is ok, which for a
 // clustered node means it has a meta leader and every stream it holds a
-// replica of is current, and JetStream is current with the meta leader. It
-// returns an error naming what is missing when ctx is done first.
+// replica of is current, JetStream is current with the meta leader, and the
+// older generations of its name have been removed from the cluster. It returns
+// an error naming what is missing when ctx is done first.
+//
+// The last is what makes a rolling restart safe to pace by Ready. A member that
+// came back empty is current long before the generation it replaced is gone,
+// and until then that generation counts toward every majority: restarting the
+// next member on that member's word takes the cluster below a majority and
+// loses what only they held.
 //
 // A node alone is ready as soon as it has recovered its streams. A node in a
 // cluster is not ready while it is a minority: one that lost its log cannot be
@@ -336,6 +360,22 @@ const readyPoll = 100 * time.Millisecond
 
 // waiting names what Ready is waiting for, or is empty when it is ready.
 func (s *Server) waiting() string {
+	if why := s.current(); why != "" {
+		return why
+	}
+	select {
+	case <-s.retired:
+		return ""
+	default:
+		return "older generations of this server are not yet removed"
+	}
+}
+
+// current names what keeps the node from serving, or is empty when its health
+// is ok and JetStream is current with the meta leader. Ready adds to it only
+// that the older generations are gone, which retire must not wait on: it is
+// what removes them.
+func (s *Server) current() string {
 	if h := s.ns.Healthz(&server.HealthzOptions{}); h.Status != "ok" {
 		return strOr(h.Error, h.Status)
 	}
@@ -345,10 +385,14 @@ func (s *Server) waiting() string {
 	return ""
 }
 
-// Shutdown stops the NATS server as a lame duck: it hands off the groups it
+// Shutdown stops the server as a lame duck: it hands off the groups it
 // leads, stops accepting clients and closes the ones it has over lameDuckSpan,
 // then stops and waits for the accept loops to drain. Safe to call once on
 // host shutdown.
+//
+// With a client connected it takes at least lameDuckGrace, the time the client
+// is given to find another member before it is closed, on a node alone as in a
+// cluster.
 func (s *Server) Shutdown() {
 	if s.ns == nil {
 		return

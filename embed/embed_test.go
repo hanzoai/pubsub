@@ -5,6 +5,7 @@ package embed
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -140,7 +141,18 @@ func (a *planeAuth) Check(c server.ClientAuthentication) bool {
 	if name == "" {
 		return true
 	}
-	acc, err := a.srv.Load().NATS().LookupAccount(name)
+	// The server is stored just after Open returns, which is when clients that
+	// were waiting for it can first be asked.
+	var s *Server
+	for deadline := time.Now().Add(5 * time.Second); s == nil && time.Now().Before(deadline); {
+		if s = a.srv.Load(); s == nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if s == nil {
+		return false
+	}
+	acc, err := s.NATS().LookupAccount(name)
 	if err != nil {
 		return false
 	}
@@ -242,9 +254,11 @@ func TestAccountsKeepTheGlobalStreams(t *testing.T) {
 // distinct token is one; the reserved names are not tokens.
 func TestAccountsRefuseAnythingButAPlainName(t *testing.T) {
 	for _, names := range [][]string{{"$G"}, {"$SYS"}, {"a b"}, {"x\n}"}, {""}, {"e", "e"}} {
-		if s, err := Open(Options{Port: -1, StoreDir: t.TempDir(), Accounts: names}); err == nil {
+		dir := t.TempDir()
+		if s, err := Open(Options{Port: -1, StoreDir: dir, Generation: "pinned", Accounts: names}); err == nil {
 			s.Shutdown()
 			t.Errorf("accounts %q were accepted", names)
 		}
+		untouched(t, fmt.Sprintf("accounts %q", names), dir)
 	}
 }
